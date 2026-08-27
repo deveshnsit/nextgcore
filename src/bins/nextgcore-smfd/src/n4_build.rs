@@ -865,6 +865,11 @@ impl PfcpMessageBuilder {
         self.add_tlv(pfcp_ie::REPORTING_TRIGGERS, &value)
     }
 
+    /// Add Measurement Period IE
+    pub fn add_measurement_period(&mut self, seconds: u32) -> &mut Self {
+        self.add_u32(pfcp_ie::MEASUREMENT_PERIOD, seconds)
+    }
+
     /// Add Volume Threshold IE
     pub fn add_volume_threshold(
         &mut self,
@@ -1509,6 +1514,7 @@ pub struct UrrParams {
     pub urr_id: u32,
     pub measurement_method: (bool, bool, bool), // (duration, volume, event)
     pub reporting_triggers: u32,
+    pub measurement_period: Option<u32>,
     pub volume_threshold: Option<(Option<u64>, Option<u64>, Option<u64>)>,
     pub volume_quota: Option<(Option<u64>, Option<u64>, Option<u64>)>,
     pub time_threshold: Option<u32>,
@@ -1529,6 +1535,11 @@ pub fn build_create_urr(params: &UrrParams) -> Vec<u8> {
 
     // Reporting Triggers
     builder.add_reporting_triggers(params.reporting_triggers);
+
+    // Measurement Period
+    if let Some(seconds) = params.measurement_period {
+        builder.add_measurement_period(seconds);
+    }
 
     // Volume Threshold
     if let Some((total, uplink, downlink)) = params.volume_threshold {

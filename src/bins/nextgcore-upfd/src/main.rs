@@ -836,7 +836,12 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             urr.volume_threshold_total = u.volume_threshold_total;
                             urr.volume_threshold_ul = u.volume_threshold_ul;
                             urr.volume_threshold_dl = u.volume_threshold_dl;
+                            urr.volume_quota_total = u.volume_quota_total;
+                            urr.volume_quota_ul = u.volume_quota_ul;
+                            urr.volume_quota_dl = u.volume_quota_dl;
                             urr.time_threshold_secs = u.time_threshold_secs;
+                            urr.time_quota_secs = u.time_quota_secs;
+                            urr.measurement_period_secs = u.measurement_period_secs;
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
                         }
                         *session.urrs.write().unwrap() = dp_urrs;

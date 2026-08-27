@@ -25,9 +25,11 @@ use nextgcore_sbi::server::{
     send_bad_request, send_not_found, SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
+use arc_swap::ArcSwap;
 
 mod binding;
 mod context;
@@ -63,6 +65,9 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Each transaction fetches-and-increments this so concurrent PDU sessions
 /// never reuse the same sequence number.
 static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
+
+/// Monotonically allocate URR IDs for rules provisioned by this SMF.
+static NEXT_URR_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Externally-reachable base URI of this SMF's SBI server, used for the
 /// callback URIs handed to the PCF (notificationUri). Set once in `main`.
@@ -211,10 +216,67 @@ struct SbiSection {
     client: Option<SbiClient>,
 }
 
+#[derive(Debug, Default, Deserialize, Clone)]
+struct MeasurementMethodConfig {
+    duration: Option<bool>,
+    volume: Option<bool>,
+    event: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ReportingTriggersConfig {
+    periodic_reporting: Option<bool>,
+    volume_threshold: Option<bool>,
+    volume_quota_exhausted: Option<bool>,
+    time_threshold: Option<bool>,
+    time_quota_exhausted: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct VolumeThresholdConfig {
+    total_volume: Option<u64>,
+    uplink_volume: Option<u64>,
+    downlink_volume: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct VolumeQuotaConfig {
+    total_volume: Option<u64>,
+    uplink_volume: Option<u64>,
+    downlink_volume: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct ApnConfigEntry {
+    apn_name: String,
+    urr_profile_ref: Option<String>, // Have kept this as Option<String> to allow for the possibility of no profile being specified
+                                     // In future, we may have fields in addition to urr_profile_ref
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct UrfProfileConfig {
+    measurement_method: Option<MeasurementMethodConfig>,
+    reporting_triggers: Option<ReportingTriggersConfig>,
+    measurement_period: Option<u32>,
+    volume_threshold: Option<VolumeThresholdConfig>,
+    volume_quota: Option<VolumeQuotaConfig>,
+    time_threshold: Option<u32>,
+    time_quota: Option<u32>,
+    quota_validity_time: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct FeatureFlagsConfig {
+    usage_quota_enforcement: bool,
+}
+
 /// Top-level `smf:` section
 #[derive(Debug, Default, Deserialize)]
 struct SmfSection {
     sbi: Option<SbiSection>,
+    apn_config: Option<HashMap<String, ApnConfigEntry>>,
+    urr_profile: Option<HashMap<String, UrfProfileConfig>>,
+    feature_flags: Option<FeatureFlagsConfig>,
 }
 
 /// Root YAML document
@@ -224,6 +286,7 @@ struct SmfYaml {
 }
 
 /// Resolved, flat configuration used at runtime
+#[derive(Debug, Clone)]
 struct SmfConfig {
     sbi_addr: String,
     sbi_port: u16,
@@ -232,6 +295,9 @@ struct SmfConfig {
     max_bearer: usize,
     /// NRF URI parsed from `smf.sbi.client.nrf[0].uri` (if present).
     nrf_uri: Option<String>,
+    apn_config: HashMap<String, ApnConfigEntry>,
+    urr_profile: HashMap<String, UrfProfileConfig>,
+    feature_flags: FeatureFlagsConfig,
 }
 
 impl Default for SmfConfig {
@@ -243,10 +309,15 @@ impl Default for SmfConfig {
             max_sess: 4096,
             max_bearer: 8192,
             nrf_uri: None,
+            apn_config: HashMap::new(),
+            urr_profile: HashMap::new(),
+            feature_flags: FeatureFlagsConfig { usage_quota_enforcement: false },
         }
     }
 }
 
+/// Load and flatten the SMF YAML configuration, falling back to defaults when
+/// the file is missing or cannot be parsed.
 fn load_config(path: &str) -> SmfConfig {
     let mut config = SmfConfig::default();
 
@@ -288,9 +359,167 @@ fn load_config(path: &str) -> SmfConfig {
                 }
             }
         }
+        config.apn_config = smf.apn_config.unwrap_or_default();
+        config.urr_profile = smf.urr_profile.unwrap_or_default();
+        config.feature_flags = smf.feature_flags.unwrap_or_default();
     }
 
     config
+}
+
+/// Global config storage (ArcSwap allows lock-free atomic updates)
+static CONFIG: LazyLock<ArcSwap<SmfConfig>> =
+    LazyLock::new(|| ArcSwap::from_pointee(SmfConfig::default()));
+
+/// Store the config path for watching
+static CONFIG_PATH: OnceLock<String> = OnceLock::new();
+
+/// Return the current atomically published SMF configuration snapshot.
+fn smf_runtime_config() -> Arc<SmfConfig> {
+    nextgcore_core::config_utils::runtime_config(&CONFIG)
+}
+
+/// Allocate the next non-zero URR ID for an SMF-provisioned usage rule.
+fn allocate_urr_id() -> u32 {
+    NEXT_URR_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1).filter(|next| *next != 0)
+        })
+        .expect("SMF URR ID space exhausted")
+}
+
+/// Load the initial SMF configuration and record its path for the file watcher.
+/// Returns the resolved path so `main()` can log it without re-resolving.
+fn initialize_config() -> String {
+    nextgcore_core::config_utils::initialize_config(
+        &CONFIG_PATH,
+        &CONFIG,
+        "SMF_CONFIG",
+        "/etc/nextgcore/smf.yaml",
+        load_config,
+    )
+}
+
+/// Resolve the shared URR profile for a DNN by applying configured values over
+/// the built-in defaults used for PFCP session establishment.
+fn resolve_shared_urr_profile_for_apn(_dnn: &str) -> Option<n4_build::UrrParams> {
+    let config = smf_runtime_config();
+
+    if !config.feature_flags.usage_quota_enforcement {
+        return None;
+    }
+
+    let configured_profile = config
+        .apn_config
+        .get(_dnn)
+        .and_then(|named| {
+            named
+                .urr_profile_ref
+                .as_deref()
+                .and_then(|profile_ref| config.urr_profile.get(profile_ref))
+        })
+        .or_else(|| {
+            (config.apn_config.is_empty() && config.urr_profile.len() == 1)
+                .then(|| config.urr_profile.values().next().expect("one profile exists"))
+        });
+
+    configured_profile
+        .map(urr_params_from_config)
+            .or_else(|| Some(default_urr_profile()))
+}
+
+/// Convert a configured URR profile into the PFCP builder's flat parameter type.
+fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams {
+    let mut triggers = 0u32;
+    if cfg_profile
+        .reporting_triggers
+        .as_ref()
+        .and_then(|rt| rt.periodic_reporting)
+        .unwrap_or(false)
+    {
+        triggers |= 0x000001;
+    }
+    if cfg_profile
+        .reporting_triggers
+        .as_ref()
+        .and_then(|rt| rt.volume_threshold)
+        .unwrap_or(true)
+    {
+        triggers |= 0x000002;
+    }
+    if cfg_profile
+        .reporting_triggers
+        .as_ref()
+        .and_then(|rt| rt.time_threshold)
+        .unwrap_or(false)
+    {
+        triggers |= 0x000004;
+    }
+    if cfg_profile
+        .reporting_triggers
+        .as_ref()
+        .and_then(|rt| rt.volume_quota_exhausted)
+        .unwrap_or(false)
+    {
+        triggers |= 0x000200;
+    }
+    if cfg_profile
+        .reporting_triggers
+        .as_ref()
+        .and_then(|rt| rt.time_quota_exhausted)
+        .unwrap_or(false)
+    {
+        triggers |= 0x000400;
+    }
+
+    n4_build::UrrParams {
+        urr_id: allocate_urr_id(),
+        measurement_method: (
+            cfg_profile
+                .measurement_method
+                .as_ref()
+                .and_then(|m| m.duration)
+                .unwrap_or(false),
+            cfg_profile
+                .measurement_method
+                .as_ref()
+                .and_then(|m| m.volume)
+                .unwrap_or(true),
+            cfg_profile
+                .measurement_method
+                .as_ref()
+                .and_then(|m| m.event)
+                .unwrap_or(false),
+        ),
+        reporting_triggers: triggers,
+        measurement_period: cfg_profile.measurement_period,
+        volume_threshold: cfg_profile
+            .volume_threshold
+            .as_ref()
+            .map(|vt| (vt.total_volume, vt.uplink_volume, vt.downlink_volume)),
+        volume_quota: cfg_profile
+            .volume_quota
+            .as_ref()
+            .map(|vq| (vq.total_volume, vq.uplink_volume, vq.downlink_volume)),
+        time_threshold: cfg_profile.time_threshold,
+        time_quota: cfg_profile.time_quota,
+        quota_validity_time: cfg_profile.quota_validity_time,
+    }
+}
+
+/// Construct the built-in URR profile used only when configuration yields no profile.
+fn default_urr_profile() -> n4_build::UrrParams {
+    n4_build::UrrParams {
+        urr_id: allocate_urr_id(),
+        measurement_method: (false, true, false),
+        reporting_triggers: 0x000002,
+        measurement_period: None,
+        volume_threshold: Some((Some(1024), None, None)),
+        volume_quota: None,
+        time_threshold: None,
+        time_quota: None,
+        quota_validity_time: None,
+    }
 }
 
 #[tokio::main]
@@ -319,24 +548,23 @@ async fn main() -> Result<()> {
     .expect("Failed to set Ctrl+C handler");
 
     // Load configuration — respect -c/--config CLI arg first, then SMF_CONFIG env var
-    let config_path = std::env::args()
-        .zip(std::env::args().skip(1))
-        .find_map(|(a, b)| {
-            if a == "-c" || a == "--config" {
-                Some(b)
-            } else {
-                None
-            }
-        })
-        .or_else(|| std::env::var("SMF_CONFIG").ok())
-        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
-    let config = load_config(&config_path);
+    let config_path = initialize_config();
+    let config = smf_runtime_config();
     log::info!("Loading configuration from {config_path}");
     log::info!(
         "SBI config: address={}, port={}",
         config.sbi_addr,
         config.sbi_port
     );
+
+    // Spawn background task to watch config file for runtime updates
+    let _config_watcher = nextgcore_core::config_utils::spawn_config_watcher(
+        &CONFIG_PATH,
+        &CONFIG,
+        shutdown.clone(),
+        load_config,
+    );
+    log::info!("Config file watcher initialized");
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -1168,6 +1396,12 @@ async fn pfcp_session_establish(
     let smf_ip = client.node_ip();
     let mut builder = PfcpMessageBuilder::new();
 
+    let urr = resolve_shared_urr_profile_for_apn(dnn);
+    if let Some(ref urr) = urr {
+        let urr_bytes = n4_build::build_create_urr(urr);
+        builder.add_tlv(pfcp_ie::CREATE_URR, &urr_bytes);
+    }
+
     // Node ID (IPv4, with the mandatory Node ID Type octet — TS 29.244 8.2.38)
     builder.add_node_id_ipv4(smf_ip);
 
@@ -1236,6 +1470,7 @@ async fn pfcp_session_establish(
         ue_ip_address: Some((Some(ue_ip), None, true)), // source
         outer_header_removal: Some(0),                  // GTP-U/UDP/IPv4
         far_id: Some(1),
+        urr_ids: urr.iter().map(|profile| profile.urr_id).collect(),
         qer_id: Some(flow_qer_id),
         qfi: Some(flow_qfi),
         ..Default::default()
@@ -1260,6 +1495,7 @@ async fn pfcp_session_establish(
         source_interface: 1, // Core (TS 29.244 8.2.24)
         ue_ip_address: Some((Some(ue_ip), None, false)), // destination
         far_id: Some(2),
+        urr_ids: urr.iter().map(|profile| profile.urr_id).collect(),
         qer_id: Some(flow_qer_id),
         qfi: Some(flow_qfi),
         ..Default::default()
@@ -3156,6 +3392,15 @@ mod tests {
     }
 
     #[test]
+    fn test_urr_ids_are_monotonic_and_non_zero() {
+        let first = allocate_urr_id();
+        let second = allocate_urr_id();
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert!(second > first);
+    }
+
+    #[test]
     fn test_load_config_extracts_sbi_and_nrf_in_one_parse() {
         use std::io::Write;
         let yaml = "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        \
@@ -3172,6 +3417,78 @@ mod tests {
         assert_eq!(config.sbi_port, 8888);
         // NRF URI now comes from the single load_config parse (no second read).
         assert_eq!(config.nrf_uri.as_deref(), Some("http://nrf.example:7777"));
+    }
+
+    #[test]
+    fn test_load_config_extracts_apn_and_urr_profile() {
+        use std::io::Write;
+        let yaml = r#"
+smf:
+  sbi:
+    server:
+      - address: 127.0.0.1
+        port: 8888
+  apn_config:
+    internet:
+      apn_name: internet.mnc001.mcc001.gprs
+      urr_profile_ref: profile_shared
+  urr_profile:
+    profile_shared:
+      measurement_method:
+        duration: false
+        volume: true
+        event: false
+      reporting_triggers:
+        periodic_reporting: true
+        volume_threshold: true
+      measurement_period: 3600
+      volume_threshold:
+        total_volume: 1024
+      volume_quota:
+        total_volume: 4096
+  feature_flags:
+    usage_quota_enforcement: true
+"#;
+        let path = std::env::temp_dir().join(format!("smf-urr-cfg-test-{}.yaml", std::process::id()));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+            .expect("write temp config");
+
+        let config = load_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(config.apn_config.get("internet").unwrap().apn_name, "internet.mnc001.mcc001.gprs");
+        assert_eq!(
+            config.apn_config.get("internet").unwrap().urr_profile_ref.as_deref(),
+            Some("profile_shared")
+        );
+        assert!(config.urr_profile.contains_key("profile_shared"));
+        assert!(config.feature_flags.usage_quota_enforcement);
+    }
+
+    #[test]
+    fn test_load_config_allows_apn_without_urr_profile_ref() {
+        use std::io::Write;
+        let yaml = r#"
+smf:
+  apn_config:
+    internet:
+      apn_name: internet
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "smf-apn-without-urr-ref-test-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+            .expect("write temp config");
+
+        let config = load_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        let apn = config.apn_config.get("internet").expect("APN config entry");
+        assert_eq!(apn.apn_name, "internet");
+        assert!(apn.urr_profile_ref.is_none());
     }
 
     // ------------------------------------------------------------------

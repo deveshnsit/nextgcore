@@ -1081,7 +1081,11 @@ pub struct DataPlaneUrr {
     pub volume_threshold_total: Option<u64>,
     pub volume_threshold_ul: Option<u64>,
     pub volume_threshold_dl: Option<u64>,
+    pub volume_quota_total: Option<u64>,
+    pub volume_quota_ul: Option<u64>,
+    pub volume_quota_dl: Option<u64>,
     pub time_threshold_secs: Option<u32>,
+    pub time_quota_secs: Option<u32>,
     pub measurement_period_secs: Option<u32>,
     /// Accumulated volume since last report
     pub acc_total_bytes: AtomicU64,
@@ -1096,6 +1100,8 @@ pub struct DataPlaneUrr {
     pub last_report_time: RwLock<Option<std::time::Instant>>,
     /// Whether a threshold has been exceeded (needs reporting)
     pub threshold_exceeded: AtomicBool,
+    /// Whether quota has been exhausted (needs enforcement and reporting)
+    pub quota_exhausted: AtomicBool,
     /// Monotonic UR-SEQN per URR (TS 29.244 8.2.60) — incremented for every
     /// usage report generated from this URR
     pub ur_seqn: std::sync::atomic::AtomicU32,
@@ -1108,7 +1114,11 @@ impl DataPlaneUrr {
             volume_threshold_total: None,
             volume_threshold_ul: None,
             volume_threshold_dl: None,
+            volume_quota_total: None,
+            volume_quota_ul: None,
+            volume_quota_dl: None,
             time_threshold_secs: None,
+            time_quota_secs: None,
             measurement_period_secs: None,
             acc_total_bytes: AtomicU64::new(0),
             acc_ul_bytes: AtomicU64::new(0),
@@ -1119,6 +1129,7 @@ impl DataPlaneUrr {
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
             threshold_exceeded: AtomicBool::new(false),
+            quota_exhausted: AtomicBool::new(false),
             ur_seqn: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -1128,26 +1139,59 @@ impl DataPlaneUrr {
         self.ur_seqn.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Record traffic and check thresholds, returns true if threshold exceeded
+    /// Record traffic and check thresholds + quotas, returns true if threshold/quota exceeded
     pub fn record(&self, bytes: u64, is_uplink: bool) -> bool {
+        // First check if quota is already exhausted
+        if self.quota_exhausted.load(Ordering::Relaxed) {
+            log::debug!(
+                "URR {}: Packet dropped, quota exhausted",
+                self.urr_id
+            );
+            return true;
+        }
+
         let total = self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
 
         if is_uplink {
             let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             self.acc_ul_pkts.fetch_add(1, Ordering::Relaxed);
+            // Check UL volume threshold
             if let Some(thresh) = self.volume_threshold_ul {
                 if ul >= thresh {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
                     return true;
                 }
             }
+            // Check UL volume quota
+            if let Some(quota) = self.volume_quota_ul {
+                if ul >= quota {
+                    log::debug!(
+                        "URR {}: Uplink volume quota exhausted ({} >= {})",
+                        self.urr_id, ul, quota
+                    );
+                    self.quota_exhausted.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
         } else {
             let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             self.acc_dl_pkts.fetch_add(1, Ordering::Relaxed);
+            // Check DL volume threshold
             if let Some(thresh) = self.volume_threshold_dl {
                 if dl >= thresh {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+            // Check DL volume quota
+            if let Some(quota) = self.volume_quota_dl {
+                if dl >= quota {
+                    log::debug!(
+                        "URR {}: Downlink volume quota exhausted ({} >= {})",
+                        self.urr_id, dl, quota
+                    );
+                    self.quota_exhausted.store(true, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -1169,12 +1213,40 @@ impl DataPlaneUrr {
             }
         }
 
+        // Check total volume quota
+        if let Some(quota) = self.volume_quota_total {
+            if total >= quota {
+                log::debug!(
+                    "URR {}: Total volume quota exhausted ({} >= {})",
+                    self.urr_id, total, quota
+                );
+                self.quota_exhausted.store(true, Ordering::Relaxed);
+                return true;
+            }
+        }
+
         // Check time threshold
         if let Some(time_thresh) = self.time_threshold_secs {
             let report_time = self.last_report_time.read().unwrap();
             if let Some(last) = *report_time {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+
+        // Check time quota
+        if let Some(time_quota) = self.time_quota_secs {
+            let report_time = self.last_report_time.read().unwrap();
+            if let Some(last) = *report_time {
+                let elapsed_secs = last.elapsed().as_secs();
+                if elapsed_secs >= time_quota as u64 {
+                    log::debug!(
+                        "URR {}: Time quota exhausted ({} >= {})",
+                        self.urr_id, elapsed_secs, time_quota
+                    );
+                    self.quota_exhausted.store(true, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -1194,6 +1266,7 @@ impl DataPlaneUrr {
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
         self.threshold_exceeded.store(false, Ordering::Relaxed);
+        self.quota_exhausted.store(false, Ordering::Relaxed);
     }
 }
 

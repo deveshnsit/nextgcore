@@ -125,6 +125,7 @@ pub mod pfcp_ie {
     pub const NODE_ID: u16 = 60;
     pub const MEASUREMENT_METHOD: u16 = 62;
     pub const USAGE_REPORT_TRIGGER: u16 = 63;
+    pub const MEASUREMENT_PERIOD: u16 = 64;
     pub const VOLUME_MEASUREMENT: u16 = 66;
     pub const DURATION_MEASUREMENT: u16 = 67;
     pub const TIME_OF_FIRST_PACKET: u16 = 69;
@@ -1572,12 +1573,29 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
         }
     }
 
-    // Reporting Triggers (IE type 37)
+    // Reporting Triggers (IE type 37) - 3 bytes
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::REPORTING_TRIGGERS) {
         if !ie.value.is_empty() {
             urr.trigger_periodic = (ie.value[0] & 0x01) != 0;
             urr.trigger_volume_threshold = (ie.value[0] & 0x02) != 0;
             urr.trigger_time_threshold = (ie.value[0] & 0x04) != 0;
+            // Bits 9 and 10 are in the third byte (byte 2)
+            if ie.value.len() >= 3 {
+                urr.trigger_volume_quota = (ie.value[2] & 0x02) != 0; // Bit 9 = bit 1 of byte 2
+                urr.trigger_time_quota = (ie.value[2] & 0x04) != 0;   // Bit 10 = bit 2 of byte 2
+            }
+        }
+    }
+
+    // Measurement Period (IE type 64) - u32 seconds
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_PERIOD) {
+        if ie.value.len() >= 4 {
+            urr.measurement_period_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
         }
     }
 
@@ -1622,6 +1640,47 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
         }
     }
 
+    // Volume Quota (IE type 73) - grouped IE with flags + values (same structure as Volume Threshold)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::VOLUME_QUOTA) {
+        if !ie.value.is_empty() {
+            let flags = ie.value[0];
+            let mut cursor = &ie.value[1..];
+            if (flags & 0x01) != 0 && cursor.len() >= 8 {
+                urr.volume_quota_total = Some(u64::from_be_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
+                    cursor[7],
+                ]));
+                cursor = &cursor[8..];
+            }
+            if (flags & 0x02) != 0 && cursor.len() >= 8 {
+                urr.volume_quota_ul = Some(u64::from_be_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
+                    cursor[7],
+                ]));
+                cursor = &cursor[8..];
+            }
+            if (flags & 0x04) != 0 && cursor.len() >= 8 {
+                urr.volume_quota_dl = Some(u64::from_be_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
+                    cursor[7],
+                ]));
+            }
+            let _ = cursor; // suppress unused warning
+        }
+    }
+
+    // Time Quota (IE type 74) - u32 seconds
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TIME_QUOTA) {
+        if ie.value.len() >= 4 {
+            urr.time_quota_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
+        }
+    }
+
     Ok(urr)
 }
 
@@ -1634,10 +1693,17 @@ pub struct ParsedCreateUrr {
     pub trigger_periodic: bool,
     pub trigger_volume_threshold: bool,
     pub trigger_time_threshold: bool,
+    pub trigger_volume_quota: bool,
+    pub trigger_time_quota: bool,
+    pub measurement_period_secs: Option<u32>,
     pub volume_threshold_total: Option<u64>,
     pub volume_threshold_ul: Option<u64>,
     pub volume_threshold_dl: Option<u64>,
+    pub volume_quota_total: Option<u64>,
+    pub volume_quota_ul: Option<u64>,
+    pub volume_quota_dl: Option<u64>,
     pub time_threshold_secs: Option<u32>,
+    pub time_quota_secs: Option<u32>,
 }
 
 /// Parsed Node ID
@@ -2475,5 +2541,120 @@ mod tests {
             Some(7),
             "parsed choose_id must be Some(7)"
         );
+    }
+
+    /// Test URR parsing with quota and measurement period fields
+    #[test]
+    fn test_parse_urr_with_quota_and_measurement_period() {
+        use bytes::BufMut;
+
+        // Construct a URR IE with URR_ID, Measurement Period, Volume Quota, and Time Quota
+        let mut urr_data = BytesMut::new();
+
+        // URR ID (IE type 81, length 4)
+        urr_data.put_u16(pfcp_ie::URR_ID);
+        urr_data.put_u16(4); // length
+        urr_data.put_u32(1); // URR ID = 1
+
+        // Measurement Period (IE type 64, length 4, value = 60 seconds)
+        urr_data.put_u16(pfcp_ie::MEASUREMENT_PERIOD);
+        urr_data.put_u16(4); // length
+        urr_data.put_u32(60); // 60 seconds
+
+        // Volume Quota (IE type 73): flags (1 byte) + values
+        // flags = 0x01 (total volume present)
+        urr_data.put_u16(pfcp_ie::VOLUME_QUOTA);
+        urr_data.put_u16(9); // length = 1 (flags) + 8 (total volume)
+        urr_data.put_u8(0x01); // total volume flag
+        urr_data.put_u64(1_000_000); // 1 MB total quota
+
+        // Time Quota (IE type 74, length 4, value = 3600 seconds)
+        urr_data.put_u16(pfcp_ie::TIME_QUOTA);
+        urr_data.put_u16(4); // length
+        urr_data.put_u32(3600); // 1 hour
+
+        // Parse the URR
+        let urr = parse_create_urr(&urr_data).expect("URR parsing must succeed");
+
+        // Verify the parsed fields
+        assert_eq!(urr.urr_id, 1, "URR ID must be 1");
+        assert_eq!(
+            urr.measurement_period_secs,
+            Some(60),
+            "Measurement period must be 60 seconds"
+        );
+        assert_eq!(
+            urr.volume_quota_total,
+            Some(1_000_000),
+            "Total volume quota must be 1_000_000"
+        );
+        assert!(urr.volume_quota_ul.is_none(), "UL volume quota must be None");
+        assert!(urr.volume_quota_dl.is_none(), "DL volume quota must be None");
+        assert_eq!(
+            urr.time_quota_secs,
+            Some(3600),
+            "Time quota must be 3600 seconds"
+        );
+    }
+
+    /// Test URR parsing with volume quota UL/DL breakdown
+    #[test]
+    fn test_parse_urr_with_volume_quota_breakdown() {
+        use bytes::BufMut;
+
+        let mut urr_data = BytesMut::new();
+
+        // URR ID
+        urr_data.put_u16(pfcp_ie::URR_ID);
+        urr_data.put_u16(4);
+        urr_data.put_u32(42);
+
+        // Volume Quota with all three components: total, uplink, downlink
+        // flags = 0x07 (0x01 | 0x02 | 0x04)
+        urr_data.put_u16(pfcp_ie::VOLUME_QUOTA);
+        urr_data.put_u16(25); // length = 1 + 8 + 8 + 8
+        urr_data.put_u8(0x07); // all flags
+        urr_data.put_u64(10_000_000); // total
+        urr_data.put_u64(5_000_000); // uplink
+        urr_data.put_u64(5_000_000); // downlink
+
+        let urr = parse_create_urr(&urr_data).expect("URR parsing must succeed");
+
+        assert_eq!(urr.urr_id, 42);
+        assert_eq!(urr.volume_quota_total, Some(10_000_000));
+        assert_eq!(urr.volume_quota_ul, Some(5_000_000));
+        assert_eq!(urr.volume_quota_dl, Some(5_000_000));
+    }
+
+    /// Test URR parsing with reporting triggers including quota bits
+    #[test]
+    fn test_parse_urr_with_quota_reporting_triggers() {
+        use bytes::BufMut;
+
+        let mut urr_data = BytesMut::new();
+
+        // URR ID
+        urr_data.put_u16(pfcp_ie::URR_ID);
+        urr_data.put_u16(4);
+        urr_data.put_u32(99);
+
+        // Reporting Triggers (3 bytes)
+        // Byte 0: bits 0-7 (periodic, volume threshold, time threshold, etc.)
+        // Byte 1: bits 8-15 (reserved)
+        // Byte 2: bits 16-23 (volume quota=bit 9=bit 1 of byte 2, time quota=bit 10=bit 2 of byte 2)
+        urr_data.put_u16(pfcp_ie::REPORTING_TRIGGERS);
+        urr_data.put_u16(3); // length
+        urr_data.put_u8(0x03); // periodic + volume threshold
+        urr_data.put_u8(0x00); // byte 1
+        urr_data.put_u8(0x06); // byte 2: volume quota (bit 1) + time quota (bit 2)
+
+        let urr = parse_create_urr(&urr_data).expect("URR parsing must succeed");
+
+        assert_eq!(urr.urr_id, 99);
+        assert!(urr.trigger_periodic, "Periodic trigger must be true");
+        assert!(urr.trigger_volume_threshold, "Volume threshold trigger must be true");
+        assert!(!urr.trigger_time_threshold, "Time threshold trigger must be false");
+        assert!(urr.trigger_volume_quota, "Volume quota trigger must be true");
+        assert!(urr.trigger_time_quota, "Time quota trigger must be true");
     }
 }

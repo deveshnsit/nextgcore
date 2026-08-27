@@ -147,6 +147,10 @@ rand = "0.9"
 # CLI argument parsing
 clap = { version = "4.4", features = ["derive"] }
 
+# Lock-free atomic config snapshots + file watching (shared config_utils)
+arc-swap = "1.7"
+notify = "6.1"
+
 # Signal handling
 ctrlc = { version = "3.4", features = ["termination"] }
 
