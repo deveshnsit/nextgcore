@@ -841,6 +841,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             urr.volume_quota_dl = u.volume_quota_dl;
                             urr.time_threshold_secs = u.time_threshold_secs;
                             urr.time_quota_secs = u.time_quota_secs;
+                            urr.trigger_periodic = u.trigger_periodic;
                             urr.measurement_period_secs = u.measurement_period_secs;
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
                         }

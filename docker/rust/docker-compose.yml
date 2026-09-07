@@ -12,7 +12,7 @@
 x-common: &common
   restart: on-failure:5
   environment: &common-env
-    RUST_LOG: info
+    RUST_LOG: "${RUST_LOG:-info}"
     RUST_BACKTRACE: 1
     # TLS Configuration (G36: SBI TLS by default)
     # Set TLS_ENABLED=true to enable HTTPS for SBI
@@ -215,7 +215,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-      RUST_LOG: info,nextgcore_amfd=debug
+      RUST_LOG: "${RUST_LOG:-info,nextgcore_amfd=debug}"
       AMF_SBI_ADDR: 172.23.0.5
       AMF_SBI_PORT: "7777"
       SMF_SBI_ADDR: 172.23.0.4
@@ -297,7 +297,7 @@ services:
       - net.ipv4.ip_forward=1
     environment:
       <<: *common-env
-      RUST_LOG: info,nextgcore_upfd=debug
+      RUST_LOG: "${RUST_LOG:-info,nextgcore_upfd=debug}"
       TLS_CERT: /etc/nextgcore/certs/upf.crt
       TLS_KEY: /etc/nextgcore/certs/upf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -328,7 +328,7 @@ services:
     container_name: nextgsim-gnb
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug
+      RUST_LOG: "${RUST_LOG:-info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug}"
     command: ["-c", "/etc/nextgsim/gnb.yaml"]
     volumes:
       - ../../../nextgsim/config:/etc/nextgsim:ro
@@ -352,7 +352,7 @@ services:
     container_name: nextgsim-ue
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_ue=debug,nextgsim_nas=debug
+      RUST_LOG: "${RUST_LOG:-info,nextgsim_ue=debug,nextgsim_nas=debug}"
     command: ["-c", "/etc/nextgsim/ue.yaml"]
     cap_add:
       - NET_ADMIN

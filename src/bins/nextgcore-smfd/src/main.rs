@@ -274,8 +274,10 @@ struct FeatureFlagsConfig {
 #[derive(Debug, Default, Deserialize)]
 struct SmfSection {
     sbi: Option<SbiSection>,
-    apn_config: Option<HashMap<String, ApnConfigEntry>>,
-    urr_profile: Option<HashMap<String, UrfProfileConfig>>,
+    #[serde(rename = "apn_config")]
+    apn_config_hash: Option<HashMap<String, ApnConfigEntry>>,
+    #[serde(rename = "urr_profile")]
+    urr_profile_hash: Option<HashMap<String, UrfProfileConfig>>,
     feature_flags: Option<FeatureFlagsConfig>,
 }
 
@@ -295,8 +297,8 @@ struct SmfConfig {
     max_bearer: usize,
     /// NRF URI parsed from `smf.sbi.client.nrf[0].uri` (if present).
     nrf_uri: Option<String>,
-    apn_config: HashMap<String, ApnConfigEntry>,
-    urr_profile: HashMap<String, UrfProfileConfig>,
+    apn_config_hash: HashMap<String, ApnConfigEntry>,
+    urr_profile_hash: HashMap<String, UrfProfileConfig>,
     feature_flags: FeatureFlagsConfig,
 }
 
@@ -309,8 +311,8 @@ impl Default for SmfConfig {
             max_sess: 4096,
             max_bearer: 8192,
             nrf_uri: None,
-            apn_config: HashMap::new(),
-            urr_profile: HashMap::new(),
+            apn_config_hash: HashMap::new(),
+            urr_profile_hash: HashMap::new(),
             feature_flags: FeatureFlagsConfig { usage_quota_enforcement: false },
         }
     }
@@ -321,6 +323,7 @@ impl Default for SmfConfig {
 fn load_config(path: &str) -> SmfConfig {
     let mut config = SmfConfig::default();
 
+    
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -336,6 +339,8 @@ fn load_config(path: &str) -> SmfConfig {
             return config;
         }
     };
+
+    log::info!("Loaded SMF YAML config from {path}, yaml.smf={:?}", yaml.smf);
 
     if let Some(smf) = yaml.smf {
         if let Some(sbi) = smf.sbi {
@@ -359,9 +364,25 @@ fn load_config(path: &str) -> SmfConfig {
                 }
             }
         }
-        config.apn_config = smf.apn_config.unwrap_or_default();
-        config.urr_profile = smf.urr_profile.unwrap_or_default();
+
+        
+        config.apn_config_hash = smf.apn_config_hash.unwrap_or_default();
+        config.urr_profile_hash = smf.urr_profile_hash.unwrap_or_default();
         config.feature_flags = smf.feature_flags.unwrap_or_default();
+        log::info!(
+            "Loaded SMF config: {} APNs, {} URR profiles, quota_enforcement={}",
+            config.apn_config_hash.len(),
+            config.urr_profile_hash.len(),
+            config.feature_flags.usage_quota_enforcement
+        );
+
+        // Log the configured APNs and URR profiles for debugging purposes
+        for (apn_name, apn_entry) in &config.apn_config_hash {
+            log::debug!("Configured APN: {} -> {:?}", apn_name, apn_entry);
+        }
+        for (profile_name, profile_entry) in &config.urr_profile_hash {
+            log::debug!("Configured URR profile: {} -> {:?}", profile_name, profile_entry);
+        }
     }
 
     config
@@ -380,10 +401,16 @@ fn smf_runtime_config() -> Arc<SmfConfig> {
 }
 
 /// Allocate the next non-zero URR ID for an SMF-provisioned usage rule.
+/// Ensures bit 8 of octet 5 (MSB, bit 31) is always 0 and rolls over after 0x7FFFFFFF.
 fn allocate_urr_id() -> u32 {
     NEXT_URR_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1).filter(|next| *next != 0)
+            let next = if current >= 0x7FFFFFFF {
+                1  // Rollover to 1 after max value
+            } else {
+                current + 1
+            };
+            Some(next)
         })
         .expect("SMF URR ID space exhausted")
 }
@@ -400,28 +427,160 @@ fn initialize_config() -> String {
     )
 }
 
-/// Resolve the shared URR profile for a DNN by applying configured values over
-/// the built-in defaults used for PFCP session establishment.
-fn resolve_shared_urr_profile_for_apn(_dnn: &str) -> Option<n4_build::UrrParams> {
+/// Load only the reloadable config elements: apn_config_hash, urr_profile_hash, and feature_flags.
+/// SBI settings (address, port, NRF URI) are NOT reloaded as they require service restart.
+fn load_reloadable_config(path: &str) -> Option<(HashMap<String, ApnConfigEntry>, HashMap<String, UrfProfileConfig>, FeatureFlagsConfig)> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Could not read SMF config '{path}': {e}. Skipping reload.");
+            return None;
+        }
+    };
+
+    let yaml: SmfYaml = match serde_yaml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Failed to parse SMF YAML config '{path}': {e}. Skipping reload.");
+            return None;
+        }
+    };
+
+    if let Some(smf) = yaml.smf {
+        let apn_config_hash = smf.apn_config_hash.unwrap_or_default();
+        let urr_profile_hash = smf.urr_profile_hash.unwrap_or_default();
+        let feature_flags = smf.feature_flags.unwrap_or_default();
+        
+        log::info!("Reloaded reloadable config: {} APNs, {} URR profiles, quota_enforcement={}",
+            apn_config_hash.len(),
+            urr_profile_hash.len(),
+            feature_flags.usage_quota_enforcement
+        );
+        
+        return Some((apn_config_hash, urr_profile_hash, feature_flags));
+    }
+
+    None
+}
+
+/// Spawn a background task to watch config file and reload only reloadable elements.
+/// This watcher updates apn_config_hash, urr_profile_hash, and feature_flags dynamically
+/// without requiring a service restart. SBI settings are not reloaded.
+fn spawn_reloadable_config_watcher(
+    config_path: &OnceLock<String>,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let config_path_str = config_path
+        .get()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
+
+    // `move` gives the spawned task ownership of its state so it may outlive
+    // this function; `async` allows it to await file-change notifications.
+    tokio::spawn(async move {
+        use notify::Watcher;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+        let path = std::path::PathBuf::from(&config_path_str);
+        let watch_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+        let mut watcher = match notify::recommended_watcher(move |_result: Result<notify::Event, _>| {
+            let _ = tx.blocking_send(());
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("Failed to initialize config file watcher: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = watcher.watch(watch_dir, notify::RecursiveMode::NonRecursive) {
+            log::error!("Failed to watch config directory: {}", e);
+            return;
+        }
+
+        loop {
+            // Check shutdown signal
+            if shutdown.load(Ordering::Relaxed) {
+                log::info!("Shutting down reloadable config watcher");
+                break;
+            }
+
+            // Wait for file change or timeout
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Some(_)) => {
+                    // Config file changed, attempt to reload reloadable elements
+                    if let Some((apn_config, urr_profiles, feature_flags)) = load_reloadable_config(&config_path_str) {
+                        let current = CONFIG.load_full();
+                        let mut new_config = (*current).clone();
+                        
+                        new_config.apn_config_hash = apn_config;
+                        new_config.urr_profile_hash = urr_profiles;
+                        new_config.feature_flags = feature_flags;
+                        
+                        CONFIG.store(Arc::new(new_config));
+                        log::info!("Config reloaded successfully");
+                    }
+                }
+                Ok(None) => {
+                    // Channel closed
+                    break;
+                }
+                Err(_) => {
+                    // Timeout, continue polling
+                }
+            }
+        }
+    })
+}
+
+
+const DEFAULT_CONFIGURED_URR_PROFILE: &str = "default_configured_urr";
+
+/// Find the configured URR profile for a DNN. Without an APN mapping, only
+/// the explicitly named default profile may be used.
+fn configured_urr_profile_for_apn<'a>(
+    config: &'a SmfConfig,
+    dnn: &str,
+) -> Option<&'a UrfProfileConfig> {
+    config
+        .apn_config_hash
+        .get(dnn)
+        .and_then(|apn| {
+            apn.urr_profile_ref
+                .as_deref()
+                .and_then(|profile_ref| {
+                    let profile = config.urr_profile_hash.get(profile_ref);
+                    log::info!("Looking up URR profile for reference '{}': {:?}", profile_ref, profile);
+                    profile
+                })
+        })
+        .or_else(|| {
+            config
+                .apn_config_hash
+                .is_empty()
+                .then(|| {
+                    log::info!("No APN config found; falling back to default URR profile");
+                    config
+                        .urr_profile_hash
+                        .get(DEFAULT_CONFIGURED_URR_PROFILE)
+                })
+                .flatten()
+        })
+}
+
+// Extract the URR profile for a given APN (DNN) from the configuration.
+// If no APN profile is selected, use only `default_configured_urr`.
+// If that is also not found, return the built-in default URR profile.
+fn get_urr(_dnn: &str) -> Option<n4_build::UrrParams> {
     let config = smf_runtime_config();
 
     if !config.feature_flags.usage_quota_enforcement {
+        log::info!("Usage quota enforcement is disabled; no URR will be generated for dnn = {_dnn}");
         return None;
     }
 
-    let configured_profile = config
-        .apn_config
-        .get(_dnn)
-        .and_then(|named| {
-            named
-                .urr_profile_ref
-                .as_deref()
-                .and_then(|profile_ref| config.urr_profile.get(profile_ref))
-        })
-        .or_else(|| {
-            (config.apn_config.is_empty() && config.urr_profile.len() == 1)
-                .then(|| config.urr_profile.values().next().expect("one profile exists"))
-        });
+    let configured_profile = configured_urr_profile_for_apn(&config, _dnn);
 
     configured_profile
         .map(urr_params_from_config)
@@ -503,12 +662,14 @@ fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams
             .map(|vq| (vq.total_volume, vq.uplink_volume, vq.downlink_volume)),
         time_threshold: cfg_profile.time_threshold,
         time_quota: cfg_profile.time_quota,
-        quota_validity_time: cfg_profile.quota_validity_time,
+        quota_validity_time: cfg_profile.quota_validity_time,//Unused as of now, but may be used in future for quota validity time
     }
 }
 
 /// Construct the built-in URR profile used only when configuration yields no profile.
 fn default_urr_profile() -> n4_build::UrrParams {
+    log::info!("Using built-in default URR profile (no configured profile found)");
+
     n4_build::UrrParams {
         urr_id: allocate_urr_id(),
         measurement_method: (false, true, false),
@@ -557,14 +718,13 @@ async fn main() -> Result<()> {
         config.sbi_port
     );
 
-    // Spawn background task to watch config file for runtime updates
-    let _config_watcher = nextgcore_core::config_utils::spawn_config_watcher(
+    // Spawn background task to watch config file for reloadable elements (apn_config, urr_profile, feature_flags)
+    // SBI settings are not reloaded as they require service restart
+    let _config_watcher = spawn_reloadable_config_watcher(
         &CONFIG_PATH,
-        &CONFIG,
         shutdown.clone(),
-        load_config,
     );
-    log::info!("Config file watcher initialized");
+    log::info!("Reloadable config watcher initialized");
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -1391,15 +1551,37 @@ async fn pfcp_session_establish(
         ue_ip[3]
     );
 
+
     // Build PFCP payload: Node ID + F-SEID + Create PDR (uplink) + Create FAR
     // (uplink) + Create PDR (downlink) + Create FAR (downlink)
     let smf_ip = client.node_ip();
     let mut builder = PfcpMessageBuilder::new();
 
-    let urr = resolve_shared_urr_profile_for_apn(dnn);
+    let urr = get_urr(dnn);
     if let Some(ref urr) = urr {
         let urr_bytes = n4_build::build_create_urr(urr);
         builder.add_tlv(pfcp_ie::CREATE_URR, &urr_bytes);
+        // Log all the URR parameters for visibility (TS 29.244 5.4.1 / TS 23.501 §5.7.4)
+        log::debug!(
+            "URR fields: id={}, measurement_method={{duration={}, volume={}, event={}}}, \
+             reporting_triggers=0x{:06x}, measurement_period={:?}, \
+             volume_threshold={:?}, volume_quota={:?}, \
+             time_threshold={:?}, time_quota={:?}, quota_validity_time={:?}",
+            urr.urr_id,
+            urr.measurement_method.0,
+            urr.measurement_method.1,
+            urr.measurement_method.2,
+            urr.reporting_triggers,
+            urr.measurement_period,
+            urr.volume_threshold,
+            urr.volume_quota,
+            urr.time_threshold,
+            urr.time_quota,
+            urr.quota_validity_time
+        );
+    }
+    else {
+        log::debug!("Unable to get URR — no usage reporting will be generated, dnn = {dnn}");
     }
 
     // Node ID (IPv4, with the mandatory Node ID Type octet — TS 29.244 8.2.38)
@@ -3389,6 +3571,7 @@ mod tests {
         assert_eq!(config.sbi_port, 7777);
         assert_eq!(config.max_ue, 1024);
         assert!(config.nrf_uri.is_none());
+        assert!(!config.feature_flags.usage_quota_enforcement);
     }
 
     #[test]
@@ -3419,6 +3602,7 @@ mod tests {
         assert_eq!(config.nrf_uri.as_deref(), Some("http://nrf.example:7777"));
     }
 
+    /// Verifies APN-to-URR profile mappings and URR config load from SMF YAML.
     #[test]
     fn test_load_config_extracts_apn_and_urr_profile() {
         use std::io::Write;
@@ -3431,9 +3615,9 @@ smf:
   apn_config:
     internet:
       apn_name: internet.mnc001.mcc001.gprs
-      urr_profile_ref: profile_shared
+      urr_profile_ref: test_urr
   urr_profile:
-    profile_shared:
+    test_urr:
       measurement_method:
         duration: false
         volume: true
@@ -3441,11 +3625,20 @@ smf:
       reporting_triggers:
         periodic_reporting: true
         volume_threshold: true
+        volume_quota_exhausted: true
+        time_threshold: true
+        time_quota_exhausted: true
       measurement_period: 3600
       volume_threshold:
         total_volume: 1024
+        uplink_volume: 512
+        downlink_volume: 512
       volume_quota:
         total_volume: 4096
+        uplink_volume: 2048
+        downlink_volume: 2048
+      time_threshold: 1800
+      time_quota: 7200
   feature_flags:
     usage_quota_enforcement: true
 "#;
@@ -3454,18 +3647,48 @@ smf:
             .and_then(|mut f| f.write_all(yaml.as_bytes()))
             .expect("write temp config");
 
+        serde_yaml::from_str::<SmfYaml>(yaml).expect("valid URR YAML fixture");
         let config = load_config(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(config.apn_config.get("internet").unwrap().apn_name, "internet.mnc001.mcc001.gprs");
         assert_eq!(
-            config.apn_config.get("internet").unwrap().urr_profile_ref.as_deref(),
-            Some("profile_shared")
+            config.apn_config_hash.get("internet").unwrap().apn_name,
+            "internet.mnc001.mcc001.gprs"
         );
-        assert!(config.urr_profile.contains_key("profile_shared"));
+        assert_eq!(
+            config.apn_config_hash.get("internet").unwrap().urr_profile_ref.as_deref(),
+            Some("test_urr")
+        );
+        println!("Loaded config: {:?}", config);
         assert!(config.feature_flags.usage_quota_enforcement);
+
+        let profile = config
+            .urr_profile_hash
+            .get("test_urr")
+            .expect("configured URR profile");
+        assert_eq!(profile.measurement_period, Some(3600));
+        assert_eq!(profile.time_threshold, Some(1800));
+        assert_eq!(profile.time_quota, Some(7200));
+        assert_eq!(
+            profile.volume_threshold.as_ref().map(|value| (
+                value.total_volume,
+                value.uplink_volume,
+                value.downlink_volume,
+            )),
+            Some((Some(1024), Some(512), Some(512)))
+        );
+        assert_eq!(
+            profile.volume_quota.as_ref().map(|value| (
+                value.total_volume,
+                value.uplink_volume,
+                value.downlink_volume,
+            )),
+            Some((Some(4096), Some(2048), Some(2048)))
+        );
     }
 
+// Verifies that an APN config entry can exist without a URR profile reference.
+// This is required as we want to extend to support APN configs for items other than URR    
     #[test]
     fn test_load_config_allows_apn_without_urr_profile_ref() {
         use std::io::Write;
@@ -3486,9 +3709,158 @@ smf:
         let config = load_config(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
 
-        let apn = config.apn_config.get("internet").expect("APN config entry");
+        let apn = config.apn_config_hash.get("internet").expect("APN config entry");
         assert_eq!(apn.apn_name, "internet");
         assert!(apn.urr_profile_ref.is_none());
+    }
+
+
+    // Ensures APN resolution only uses the default URR profile when the configured name exists.
+    #[test]
+    fn default_urr_profile_requires_default_configured_name() {
+        use std::io::Write;
+
+        // Test 1: No APN config and no default URR profile defined
+        let yaml_no_apn_no_default = r#"
+smf:
+  urr_profile:
+    another_profile:
+      measurement_method:
+        duration: false
+        volume: true
+        event: false
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "smf-default-urr-test-no-apn-1-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml_no_apn_no_default.as_bytes()))
+            .expect("write temp config");
+
+        let config = load_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        // Without default URR profile defined, should return None
+        assert!(configured_urr_profile_for_apn(&config, "internet").is_none());
+
+        // Test 2: No APN config but default URR profile defined
+        let yaml_no_apn_with_default = r#"
+smf:
+  urr_profile:
+    default_configured_urr:
+      measurement_method:
+        duration: false
+        volume: true
+        event: false
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "smf-default-urr-test-no-apn-2-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml_no_apn_with_default.as_bytes()))
+            .expect("write temp config");
+
+        let config = load_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        // With default URR profile defined and no APN config, should return Some
+        assert!(configured_urr_profile_for_apn(&config, "internet").is_some());
+    }
+
+    // Ensures YAML reload correctly updates default URR profile availability.
+    #[test]
+    fn default_urr_profile_reload_updates_profile_resolution() {
+        use std::io::Write;
+
+        // Test reload: start without default URR profile, then reload with it
+        let yaml_initial = r#"
+smf:
+  urr_profile:
+    another_profile:
+      measurement_method:
+        duration: false
+        volume: true
+        event: false
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "smf-default-urr-reload-test-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml_initial.as_bytes()))
+            .expect("write temp config");
+
+        // Initial load: no default URR profile
+        let (_apn_hash, urr_hash, _flags) = load_reloadable_config(path.to_str().unwrap())
+            .expect("initial config load");
+        assert!(urr_hash.get(DEFAULT_CONFIGURED_URR_PROFILE).is_none());
+
+        // Update the file to include default URR profile
+        let yaml_updated = r#"
+smf:
+  urr_profile:
+    another_profile:
+      measurement_method:
+        duration: false
+        volume: true
+        event: false
+    default_configured_urr:
+      measurement_method:
+        duration: false
+        volume: true
+        event: false
+      measurement_period: 3600
+      volume_threshold:
+        total_volume: 1024
+"#;
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml_updated.as_bytes()))
+            .expect("write updated config");
+
+        // Reload: should now have default URR profile
+        let (_apn_hash_reloaded, urr_hash_reloaded, _flags_reloaded) = load_reloadable_config(path.to_str().unwrap())
+            .expect("reloaded config");
+        assert!(urr_hash_reloaded.get(DEFAULT_CONFIGURED_URR_PROFILE).is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    // Verifies that get_urr returns None when
+    // usage quota enforcement is disabled (the default).
+    // When enforcement is enabled, it would return the default URR profile for APNs
+    // without explicit configuration.
+    #[test]
+    fn resolve_shared_urr_profile_enforces_feature_flag() {
+        // With the default config (usage_quota_enforcement: false),
+        // get_urr should return None
+        // This ensures quota enforcement can be disabled globally
+        let profile_opt = get_urr("test_dnn");
+        assert!(
+            profile_opt.is_none(),
+            "get_urr should return None when enforcement is disabled"
+        );
+    }
+
+    // Verifies that the default_urr_profile() has the expected characteristics
+    // that would be returned by get_urr when enforcement
+    // is enabled and no configured profile exists.
+    #[test]
+    fn resolve_shared_urr_profile_fallback_characteristics() {
+        // Verify that the built-in default profile (used as fallback) has:
+        // - Volume measurement method enabled
+        // - Default volume threshold of 1024 bytes
+        // - Periodic reporting trigger
+        let default = default_urr_profile();
+        assert_eq!(default.measurement_method, (false, true, false), "Volume measurement enabled");
+        assert_eq!(default.reporting_triggers, 0x000002, "Periodic reporting enabled");
+        assert_eq!(
+            default.volume_threshold,
+            Some((Some(1024), None, None)),
+            "Default volume threshold is 1024 bytes"
+        );
     }
 
     // ------------------------------------------------------------------

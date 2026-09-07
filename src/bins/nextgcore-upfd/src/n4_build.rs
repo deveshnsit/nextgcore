@@ -1579,10 +1579,10 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
             urr.trigger_periodic = (ie.value[0] & 0x01) != 0;
             urr.trigger_volume_threshold = (ie.value[0] & 0x02) != 0;
             urr.trigger_time_threshold = (ie.value[0] & 0x04) != 0;
-            // Bits 9 and 10 are in the third byte (byte 2)
-            if ie.value.len() >= 3 {
-                urr.trigger_volume_quota = (ie.value[2] & 0x02) != 0; // Bit 9 = bit 1 of byte 2
-                urr.trigger_time_quota = (ie.value[2] & 0x04) != 0;   // Bit 10 = bit 2 of byte 2
+            // VOLQU and TIMQU are respectively bits 1 and 2 of octet 6.
+            if ie.value.len() >= 2 {
+                urr.trigger_volume_quota = (ie.value[1] & 0x01) != 0;
+                urr.trigger_time_quota = (ie.value[1] & 0x02) != 0;
             }
         }
     }
@@ -2640,13 +2640,13 @@ mod tests {
 
         // Reporting Triggers (3 bytes)
         // Byte 0: bits 0-7 (periodic, volume threshold, time threshold, etc.)
-        // Byte 1: bits 8-15 (reserved)
-        // Byte 2: bits 16-23 (volume quota=bit 9=bit 1 of byte 2, time quota=bit 10=bit 2 of byte 2)
+        // Byte 1: VOLQU (bit 1) and TIMQU (bit 2).
+        // Byte 2: (Not used) reserved + REEMR (REport the End Marker Reception) UPINT (User Plane Inactivity Timer)
         urr_data.put_u16(pfcp_ie::REPORTING_TRIGGERS);
         urr_data.put_u16(3); // length
         urr_data.put_u8(0x03); // periodic + volume threshold
-        urr_data.put_u8(0x00); // byte 1
-        urr_data.put_u8(0x06); // byte 2: volume quota (bit 1) + time quota (bit 2)
+        urr_data.put_u8(0x03); // volume quota + time quota
+        urr_data.put_u8(0x00); // byte 2 (not used)
 
         let urr = parse_create_urr(&urr_data).expect("URR parsing must succeed");
 

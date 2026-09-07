@@ -1086,6 +1086,8 @@ pub struct DataPlaneUrr {
     pub volume_quota_dl: Option<u64>,
     pub time_threshold_secs: Option<u32>,
     pub time_quota_secs: Option<u32>,
+    /// Whether the PERIO reporting trigger was provisioned for this URR.
+    pub trigger_periodic: bool,
     pub measurement_period_secs: Option<u32>,
     /// Accumulated volume since last report
     pub acc_total_bytes: AtomicU64,
@@ -1119,6 +1121,7 @@ impl DataPlaneUrr {
             volume_quota_dl: None,
             time_threshold_secs: None,
             time_quota_secs: None,
+            trigger_periodic: false,
             measurement_period_secs: None,
             acc_total_bytes: AtomicU64::new(0),
             acc_ul_bytes: AtomicU64::new(0),
@@ -1139,7 +1142,8 @@ impl DataPlaneUrr {
         self.ur_seqn.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Record traffic and check thresholds + quotas, returns true if threshold/quota exceeded
+    /// Record traffic and check thresholds plus quotas. Returns true only when
+    /// a quota is exhausted; threshold crossings are recorded for reporting.
     pub fn record(&self, bytes: u64, is_uplink: bool) -> bool {
         // First check if quota is already exhausted
         if self.quota_exhausted.load(Ordering::Relaxed) {
@@ -1160,7 +1164,6 @@ impl DataPlaneUrr {
             if let Some(thresh) = self.volume_threshold_ul {
                 if ul >= thresh {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    return true;
                 }
             }
             // Check UL volume quota
@@ -1181,7 +1184,6 @@ impl DataPlaneUrr {
             if let Some(thresh) = self.volume_threshold_dl {
                 if dl >= thresh {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    return true;
                 }
             }
             // Check DL volume quota
@@ -1209,7 +1211,6 @@ impl DataPlaneUrr {
         if let Some(thresh) = self.volume_threshold_total {
             if total >= thresh {
                 self.threshold_exceeded.store(true, Ordering::Relaxed);
-                return true;
             }
         }
 
@@ -1231,7 +1232,6 @@ impl DataPlaneUrr {
             if let Some(last) = *report_time {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    return true;
                 }
             }
         }
@@ -1756,7 +1756,7 @@ impl DataPlaneSession {
         }
     }
 
-    /// Record traffic in all matching URRs. Returns true if any threshold exceeded.
+    /// Record traffic in all matching URRs. Returns true if any quota is exhausted.
     pub fn record_urrs(&self, urr_ids: &[u32], bytes: u64, is_uplink: bool) -> bool {
         let urrs = self.urrs.read().unwrap();
         let mut any_exceeded = false;
@@ -2303,8 +2303,10 @@ impl DataPlane {
             }
 
             // Record URR usage
-            if !urr_ids.is_empty() {
-                session.record_urrs(&urr_ids, payload_len, true);
+            if !urr_ids.is_empty() && session.record_urrs(&urr_ids, payload_len, true) {
+                log::debug!("UL packet dropped because a URR quota is exhausted");
+                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                return;
             }
         } else {
             // No PDR matched: discard (TS 23.501 5.8.2 — packets not
@@ -2515,8 +2517,10 @@ impl DataPlane {
         };
 
         // Record URR usage on forwarded packets
-        if !urr_ids.is_empty() {
-            session.record_urrs(&urr_ids, payload_len, false);
+        if !urr_ids.is_empty() && session.record_urrs(&urr_ids, payload_len, false) {
+            log::debug!("DL packet dropped because a URR quota is exhausted");
+            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return;
         }
 
         // Apply DSCP to the OUTER transport (GTP-U/UDP/IP) header, NOT the
@@ -2855,9 +2859,9 @@ impl DataPlane {
                 }
             }
 
-            // Also check time-based thresholds (measurement period)
+            // Periodic reports require both the PERIO trigger and a period.
             for (urr_id, urr) in urrs.iter() {
-                if !urr.threshold_exceeded.load(Ordering::Relaxed) {
+                if urr.trigger_periodic && !urr.threshold_exceeded.load(Ordering::Relaxed) {
                     if let Some(period) = urr.measurement_period_secs {
                         let last_report = urr.last_report_time.read().unwrap();
                         if let Some(last) = *last_report {
@@ -4062,6 +4066,41 @@ mod tests {
         assert_eq!(urr.next_ur_seqn(), 0);
         assert_eq!(urr.next_ur_seqn(), 1);
         assert_eq!(urr.next_ur_seqn(), 2);
+    }
+
+    // Test that a newly created URR defaults to trigger_periodic=false and no measurement period.
+    #[test]
+    fn test_periodic_urr_defaults_to_trigger_disabled() {
+        let urr = DataPlaneUrr::new(1);
+        assert!(!urr.trigger_periodic);
+        assert!(urr.measurement_period_secs.is_none());
+    }
+
+    // Test that a URR with a volume threshold does not exhaust the volume quota until the volume quata is exceeded.
+    #[test]
+    fn test_urr_threshold_does_not_exhaust_volume_quota() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.volume_threshold_total = Some(50);
+        urr.volume_quota_total = Some(100);
+
+        assert!(!urr.record(50, true));
+        assert!(urr.threshold_exceeded.load(Ordering::Relaxed));
+        assert!(!urr.quota_exhausted.load(Ordering::Relaxed));
+
+        assert!(urr.record(50, true));
+        assert!(urr.quota_exhausted.load(Ordering::Relaxed));
+    }
+
+    // Test that a URR with a time quota does not exhaust the quota until the time quota is exceeded.
+    #[test]
+    fn test_urr_time_quota_exhaustion() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.time_quota_secs = Some(60);
+        *urr.last_report_time.write().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
+        assert!(urr.record(1, true));
+        assert!(urr.quota_exhausted.load(Ordering::Relaxed));
     }
 
     /// End-to-end buffering behavior: DL packets under a BUFF+NOCP FAR are
