@@ -843,12 +843,22 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             urr.time_quota_secs = u.time_quota_secs;
                             urr.trigger_periodic = u.trigger_periodic;
                             urr.measurement_period_secs = u.measurement_period_secs;
+
+                            log::debug!(
+                                "Installing URR {} (vol_thresh_total={:?}, vol_quota_total={:?}, time_thresh_secs={:?}, time_quota_secs={:?}) for SEID={upf_seid:#x}",
+                                urr.urr_id, urr.volume_threshold_total, urr.volume_quota_total, urr.time_threshold_secs, urr.time_quota_secs
+                            );
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
+
                         }
                         *session.urrs.write().unwrap() = dp_urrs;
                     }
+                    else {
+                        log::debug!("No URRs provided for SEID={upf_seid:#x}");
+                    }
 
-                    log::info!(
+
+                    log::debug!(
                         "Installed rules: {} PDRs, {} FARs, {} QERs, {} URRs for SEID={upf_seid:#x}",
                         pdrs.len(), fars.len(), qers.len(), urrs.len()
                     );

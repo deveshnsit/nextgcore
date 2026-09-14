@@ -28,8 +28,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, OnceLock};
-use arc_swap::ArcSwap;
+use std::sync::Arc;
 
 mod binding;
 mod context;
@@ -388,18 +387,6 @@ fn load_config(path: &str) -> SmfConfig {
     config
 }
 
-/// Global config storage (ArcSwap allows lock-free atomic updates)
-static CONFIG: LazyLock<ArcSwap<SmfConfig>> =
-    LazyLock::new(|| ArcSwap::from_pointee(SmfConfig::default()));
-
-/// Store the config path for watching
-static CONFIG_PATH: OnceLock<String> = OnceLock::new();
-
-/// Return the current atomically published SMF configuration snapshot.
-fn smf_runtime_config() -> Arc<SmfConfig> {
-    nextgcore_core::config_utils::runtime_config(&CONFIG)
-}
-
 /// Allocate the next non-zero URR ID for an SMF-provisioned usage rule.
 /// Ensures bit 8 of octet 5 (MSB, bit 31) is always 0 and rolls over after 0x7FFFFFFF.
 fn allocate_urr_id() -> u32 {
@@ -415,130 +402,19 @@ fn allocate_urr_id() -> u32 {
         .expect("SMF URR ID space exhausted")
 }
 
-/// Load the initial SMF configuration and record its path for the file watcher.
-/// Returns the resolved path so `main()` can log it without re-resolving.
-fn initialize_config() -> String {
-    nextgcore_core::config_utils::initialize_config(
-        &CONFIG_PATH,
-        &CONFIG,
-        "SMF_CONFIG",
-        "/etc/nextgcore/smf.yaml",
-        load_config,
-    )
+fn config_path() -> String {
+    std::env::args()
+        .zip(std::env::args().skip(1))
+        .find_map(|(a, b)| (a == "-c" || a == "--config").then_some(b))
+        .or_else(|| std::env::var("SMF_CONFIG").ok())
+        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string())
 }
-
-/// Load only the reloadable config elements: apn_config_hash, urr_profile_hash, and feature_flags.
-/// SBI settings (address, port, NRF URI) are NOT reloaded as they require service restart.
-fn load_reloadable_config(path: &str) -> Option<(HashMap<String, ApnConfigEntry>, HashMap<String, UrfProfileConfig>, FeatureFlagsConfig)> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Could not read SMF config '{path}': {e}. Skipping reload.");
-            return None;
-        }
-    };
-
-    let yaml: SmfYaml = match serde_yaml::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to parse SMF YAML config '{path}': {e}. Skipping reload.");
-            return None;
-        }
-    };
-
-    if let Some(smf) = yaml.smf {
-        let apn_config_hash = smf.apn_config_hash.unwrap_or_default();
-        let urr_profile_hash = smf.urr_profile_hash.unwrap_or_default();
-        let feature_flags = smf.feature_flags.unwrap_or_default();
-        
-        log::info!("Reloaded reloadable config: {} APNs, {} URR profiles, quota_enforcement={}",
-            apn_config_hash.len(),
-            urr_profile_hash.len(),
-            feature_flags.usage_quota_enforcement
-        );
-        
-        return Some((apn_config_hash, urr_profile_hash, feature_flags));
-    }
-
-    None
-}
-
-/// Spawn a background task to watch config file and reload only reloadable elements.
-/// This watcher updates apn_config_hash, urr_profile_hash, and feature_flags dynamically
-/// without requiring a service restart. SBI settings are not reloaded.
-fn spawn_reloadable_config_watcher(
-    config_path: &OnceLock<String>,
-    shutdown: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    let config_path_str = config_path
-        .get()
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
-
-    // `move` gives the spawned task ownership of its state so it may outlive
-    // this function; `async` allows it to await file-change notifications.
-    tokio::spawn(async move {
-        use notify::Watcher;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-
-        let path = std::path::PathBuf::from(&config_path_str);
-        let watch_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-
-        let mut watcher = match notify::recommended_watcher(move |_result: Result<notify::Event, _>| {
-            let _ = tx.blocking_send(());
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("Failed to initialize config file watcher: {}", e);
-                return;
-            }
-        };
-
-        if let Err(e) = watcher.watch(watch_dir, notify::RecursiveMode::NonRecursive) {
-            log::error!("Failed to watch config directory: {}", e);
-            return;
-        }
-
-        loop {
-            // Check shutdown signal
-            if shutdown.load(Ordering::Relaxed) {
-                log::info!("Shutting down reloadable config watcher");
-                break;
-            }
-
-            // Wait for file change or timeout
-            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
-                Ok(Some(_)) => {
-                    // Config file changed, attempt to reload reloadable elements
-                    if let Some((apn_config, urr_profiles, feature_flags)) = load_reloadable_config(&config_path_str) {
-                        let current = CONFIG.load_full();
-                        let mut new_config = (*current).clone();
-                        
-                        new_config.apn_config_hash = apn_config;
-                        new_config.urr_profile_hash = urr_profiles;
-                        new_config.feature_flags = feature_flags;
-                        
-                        CONFIG.store(Arc::new(new_config));
-                        log::info!("Config reloaded successfully");
-                    }
-                }
-                Ok(None) => {
-                    // Channel closed
-                    break;
-                }
-                Err(_) => {
-                    // Timeout, continue polling
-                }
-            }
-        }
-    })
-}
-
 
 const DEFAULT_CONFIGURED_URR_PROFILE: &str = "default_configured_urr";
 
-/// Find the configured URR profile for a DNN. Without an APN mapping, only
-/// the explicitly named default profile may be used.
+/// Find the configured URR profile for a DNN. In case a DNN has no explicitly configured URR profile,
+/// the explicitly configured default profile may be used.
+/// If that is also missing, the built-in default URR profile is used , but that is not returned by this function; it is returned by `get_urr()`.
 fn configured_urr_profile_for_apn<'a>(
     config: &'a SmfConfig,
     dnn: &str,
@@ -551,29 +427,25 @@ fn configured_urr_profile_for_apn<'a>(
                 .as_deref()
                 .and_then(|profile_ref| {
                     let profile = config.urr_profile_hash.get(profile_ref);
-                    log::info!("Looking up URR profile for reference '{}': {:?}", profile_ref, profile);
+                    log::debug!("Looking up URR profile for reference '{}': {:?}", profile_ref, profile);
                     profile
                 })
         })
         .or_else(|| {
-            config
-                .apn_config_hash
-                .is_empty()
-                .then(|| {
-                    log::info!("No APN config found; falling back to default URR profile");
-                    config
-                        .urr_profile_hash
-                        .get(DEFAULT_CONFIGURED_URR_PROFILE)
+                log::debug!("No URR profile mapping found for APN '{}'; looking for configured default URR profile", dnn);
+                config.urr_profile_hash.get(DEFAULT_CONFIGURED_URR_PROFILE).or_else(|| {
+                    log::debug!("No configured default URR profile found; will use built-in default");
+                    None
                 })
-                .flatten()
         })
 }
+
 
 // Extract the URR profile for a given APN (DNN) from the configuration.
 // If no APN profile is selected, use only `default_configured_urr`.
 // If that is also not found, return the built-in default URR profile.
 fn get_urr(_dnn: &str) -> Option<n4_build::UrrParams> {
-    let config = smf_runtime_config();
+    let config = load_config(&config_path());
 
     if !config.feature_flags.usage_quota_enforcement {
         log::info!("Usage quota enforcement is disabled; no URR will be generated for dnn = {_dnn}");
@@ -709,22 +581,14 @@ async fn main() -> Result<()> {
     .expect("Failed to set Ctrl+C handler");
 
     // Load configuration — respect -c/--config CLI arg first, then SMF_CONFIG env var
-    let config_path = initialize_config();
-    let config = smf_runtime_config();
+    let config_path = config_path();
+    let config = load_config(&config_path);
     log::info!("Loading configuration from {config_path}");
     log::info!(
         "SBI config: address={}, port={}",
         config.sbi_addr,
         config.sbi_port
     );
-
-    // Spawn background task to watch config file for reloadable elements (apn_config, urr_profile, feature_flags)
-    // SBI settings are not reloaded as they require service restart
-    let _config_watcher = spawn_reloadable_config_watcher(
-        &CONFIG_PATH,
-        shutdown.clone(),
-    );
-    log::info!("Reloadable config watcher initialized");
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -1027,6 +891,27 @@ async fn handle_pfcp_incoming(
     }
 }
 
+/// Render the Report Type IE (TS 29.244 Table 7.5.8.1-2, octet 5) as the
+/// names of its set flags, e.g. "DLDR+USAR".
+fn report_type_string(report_type: u8) -> String {
+    let rt = nextgcore_pfcp::types::ReportType::decode(report_type);
+    let flags: [(bool, &str); 7] = [
+        (rt.dldr, "DLDR (Downlink Data Report)"),
+        (rt.usar, "USAR (Usage Report)"),
+        (rt.erir, "ERIR (Error Indication Report)"),
+        (rt.upir, "UPIR (User Plane Inactivity Report)"),
+        (rt.tmir, "TMIR (TSC Management Information Report)"),
+        (rt.sesr, "SESR (Session Report)"),
+        (rt.uisr, "UISR (UP Initiated Session Request)"),
+    ];
+    let names: Vec<&str> = flags.into_iter().filter(|(set, _)| *set).map(|(_, n)| n).collect();
+    if names.is_empty() {
+        "NONE".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// Handle PFCP Session Report Request (message type 56) from UPF.
 ///
 /// The UPF sends this when a URR threshold is crossed.  The SMF logs the
@@ -1076,6 +961,11 @@ async fn handle_pfcp_session_report(
         return;
     };
 
+    log::debug!(
+        "Session Report Request: SEID=0x{seid:016x}, seq={seq}, \
+         report_type=0x{report_type:02x} ({})",
+        report_type_string(report_type)
+    );
     // Downlink Data Report (DLDR, bit 0x01): the UPF buffered the first DL
     // packet for an idle session — in a full deployment this triggers the
     // Network Triggered Service Request (N1N2 transfer / paging via AMF).
@@ -1128,8 +1018,8 @@ async fn handle_pfcp_session_report(
             break;
         }
 
-        // IE type 78 = Usage Report within Session Report Request (TS 29.244)
-        if ie_type == 78 {
+        // IE type 80 = Usage Report within Session Report Request (TS 29.244)
+        if ie_type == 80 {
             let ur = &payload[ie_start..ie_end];
             let mut ur_off = 0;
             let mut urr_id: u32 = 0;
@@ -1148,8 +1038,8 @@ async fn handle_pfcp_session_report(
                     81 if l >= 4 => {
                         urr_id = u32::from_be_bytes(ur[s..s + 4].try_into().unwrap_or([0u8; 4]));
                     }
-                    // Volume Measurement (IE type 42): flags(1) + total(8) + ul(8) + dl(8)
-                    42 if l >= 1 => {
+                    // Volume Measurement (IE type 66): flags(1) + total(8) + ul(8) + dl(8)
+                    66 if l >= 1 => {
                         let flags = ur[s];
                         let mut v = s + 1;
                         if flags & 0x01 != 0 && v + 8 <= e {
@@ -1169,7 +1059,7 @@ async fn handle_pfcp_session_report(
                 }
                 ur_off = e;
             }
-            log::info!(
+            log::debug!(
                 "PFCP Usage Report: SEID=0x{seid:016x}, URR ID={urr_id}, \
                  UL={vol_ul} bytes, DL={vol_dl} bytes"
             );
@@ -3575,6 +3465,40 @@ mod tests {
     }
 
     #[test]
+    fn test_report_type_string_decodes_set_flags() {
+        assert_eq!(report_type_string(0x00), "NONE");
+        assert_eq!(report_type_string(0x01), "DLDR (Downlink Data Report)");
+        assert_eq!(report_type_string(0x02), "USAR (Usage Report)");
+        assert_eq!(report_type_string(0x04), "ERIR (Error Indication Report)");
+        assert_eq!(
+            report_type_string(0x08),
+            "UPIR (User Plane Inactivity Report)"
+        );
+        assert_eq!(
+            report_type_string(0x10),
+            "TMIR (TSC Management Information Report)"
+        );
+        assert_eq!(report_type_string(0x20), "SESR (Session Report)");
+        assert_eq!(
+            report_type_string(0x40),
+            "UISR (UP Initiated Session Request)"
+        );
+        assert_eq!(
+            report_type_string(0x03),
+            "DLDR (Downlink Data Report), USAR (Usage Report)"
+        );
+        assert_eq!(
+            report_type_string(0x7F),
+            "DLDR (Downlink Data Report), USAR (Usage Report), \
+             ERIR (Error Indication Report), UPIR (User Plane Inactivity Report), \
+             TMIR (TSC Management Information Report), SESR (Session Report), \
+             UISR (UP Initiated Session Request)"
+        );
+        // Bit 8 (spare) must never surface in the rendered string.
+        assert_eq!(report_type_string(0x80), "NONE");
+    }
+
+    #[test]
     fn test_urr_ids_are_monotonic_and_non_zero() {
         let first = allocate_urr_id();
         let second = allocate_urr_id();
@@ -3768,65 +3692,6 @@ smf:
         // With default URR profile defined and no APN config, should return Some
         assert!(configured_urr_profile_for_apn(&config, "internet").is_some());
     }
-
-    // Ensures YAML reload correctly updates default URR profile availability.
-    #[test]
-    fn default_urr_profile_reload_updates_profile_resolution() {
-        use std::io::Write;
-
-        // Test reload: start without default URR profile, then reload with it
-        let yaml_initial = r#"
-smf:
-  urr_profile:
-    another_profile:
-      measurement_method:
-        duration: false
-        volume: true
-        event: false
-"#;
-        let path = std::env::temp_dir().join(format!(
-            "smf-default-urr-reload-test-{}.yaml",
-            std::process::id()
-        ));
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(yaml_initial.as_bytes()))
-            .expect("write temp config");
-
-        // Initial load: no default URR profile
-        let (_apn_hash, urr_hash, _flags) = load_reloadable_config(path.to_str().unwrap())
-            .expect("initial config load");
-        assert!(urr_hash.get(DEFAULT_CONFIGURED_URR_PROFILE).is_none());
-
-        // Update the file to include default URR profile
-        let yaml_updated = r#"
-smf:
-  urr_profile:
-    another_profile:
-      measurement_method:
-        duration: false
-        volume: true
-        event: false
-    default_configured_urr:
-      measurement_method:
-        duration: false
-        volume: true
-        event: false
-      measurement_period: 3600
-      volume_threshold:
-        total_volume: 1024
-"#;
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(yaml_updated.as_bytes()))
-            .expect("write updated config");
-
-        // Reload: should now have default URR profile
-        let (_apn_hash_reloaded, urr_hash_reloaded, _flags_reloaded) = load_reloadable_config(path.to_str().unwrap())
-            .expect("reloaded config");
-        assert!(urr_hash_reloaded.get(DEFAULT_CONFIGURED_URR_PROFILE).is_some());
-
-        let _ = std::fs::remove_file(&path);
-    }
-
 
     // Verifies that get_urr returns None when
     // usage quota enforcement is disabled (the default).

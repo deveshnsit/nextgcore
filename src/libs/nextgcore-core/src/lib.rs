@@ -4,7 +4,6 @@
 //! the NextGCore codebase. It is a direct port of lib/core/ from the C implementation.
 
 pub mod async_timer; // Async timer manager for NF event loops
-pub mod config_utils; // Shared NF config path-resolution + ArcSwap reload store
 pub mod conv; // Conversion utilities (nextgcore-conv.h)
 pub mod distributed_timer;
 pub mod errno; // Error codes (nextgcore-errno.h)

@@ -1100,10 +1100,17 @@ pub struct DataPlaneUrr {
     pub first_pkt_time: RwLock<Option<std::time::Instant>>,
     /// Timestamp of last report
     pub last_report_time: RwLock<Option<std::time::Instant>>,
-    /// Whether a threshold has been exceeded (needs reporting)
-    pub threshold_exceeded: AtomicBool,
-    /// Whether quota has been exhausted (needs enforcement and reporting)
-    pub quota_exhausted: AtomicBool,
+    //Whether a volume or time threshold has been exceeded — reported as VOLTH/TIMTH
+    pub volume_threshold_exceeded: AtomicBool,
+    pub time_threshold_exceeded: AtomicBool,
+    /// Whether a volume quota (UL/DL/total) has been exhausted — reported as VOLQU
+    pub volume_quota_exhausted: AtomicBool,
+    /// Whether the volume quota exhaustion event has already been reported
+    pub volume_quota_reported: AtomicBool,
+    /// Whether the time quota has been exhausted — reported as TIMQU
+    pub time_quota_exhausted: AtomicBool,
+    /// Whether the time quota exhaustion event has already been reported
+    pub time_quota_reported: AtomicBool,
     /// Monotonic UR-SEQN per URR (TS 29.244 8.2.60) — incremented for every
     /// usage report generated from this URR
     pub ur_seqn: std::sync::atomic::AtomicU32,
@@ -1131,8 +1138,12 @@ impl DataPlaneUrr {
             acc_dl_pkts: AtomicU64::new(0),
             first_pkt_time: RwLock::new(None),
             last_report_time: RwLock::new(Some(std::time::Instant::now())),
-            threshold_exceeded: AtomicBool::new(false),
-            quota_exhausted: AtomicBool::new(false),
+            volume_threshold_exceeded: AtomicBool::new(false),
+            time_threshold_exceeded: AtomicBool::new(false),
+            volume_quota_exhausted: AtomicBool::new(false),
+            volume_quota_reported: AtomicBool::new(false),
+            time_quota_exhausted: AtomicBool::new(false),
+            time_quota_reported: AtomicBool::new(false),
             ur_seqn: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -1145,8 +1156,10 @@ impl DataPlaneUrr {
     /// Record traffic and check thresholds plus quotas. Returns true only when
     /// a quota is exhausted; threshold crossings are recorded for reporting.
     pub fn record(&self, bytes: u64, is_uplink: bool) -> bool {
-        // First check if quota is already exhausted
-        if self.quota_exhausted.load(Ordering::Relaxed) {
+        // First check if a quota is already exhausted
+        if self.volume_quota_exhausted.load(Ordering::Relaxed)
+            || self.time_quota_exhausted.load(Ordering::Relaxed)
+        {
             log::debug!(
                 "URR {}: Packet dropped, quota exhausted",
                 self.urr_id
@@ -1163,7 +1176,7 @@ impl DataPlaneUrr {
             // Check UL volume threshold
             if let Some(thresh) = self.volume_threshold_ul {
                 if ul >= thresh {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    self.volume_threshold_exceeded.store(true, Ordering::Relaxed);
                 }
             }
             // Check UL volume quota
@@ -1173,7 +1186,7 @@ impl DataPlaneUrr {
                         "URR {}: Uplink volume quota exhausted ({} >= {})",
                         self.urr_id, ul, quota
                     );
-                    self.quota_exhausted.store(true, Ordering::Relaxed);
+                    self.volume_quota_exhausted.store(true, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -1183,7 +1196,7 @@ impl DataPlaneUrr {
             // Check DL volume threshold
             if let Some(thresh) = self.volume_threshold_dl {
                 if dl >= thresh {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    self.volume_threshold_exceeded.store(true, Ordering::Relaxed);
                 }
             }
             // Check DL volume quota
@@ -1193,7 +1206,7 @@ impl DataPlaneUrr {
                         "URR {}: Downlink volume quota exhausted ({} >= {})",
                         self.urr_id, dl, quota
                     );
-                    self.quota_exhausted.store(true, Ordering::Relaxed);
+                    self.volume_quota_exhausted.store(true, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -1210,7 +1223,7 @@ impl DataPlaneUrr {
         // Check total volume threshold
         if let Some(thresh) = self.volume_threshold_total {
             if total >= thresh {
-                self.threshold_exceeded.store(true, Ordering::Relaxed);
+                self.volume_threshold_exceeded.store(true, Ordering::Relaxed);
             }
         }
 
@@ -1221,7 +1234,7 @@ impl DataPlaneUrr {
                     "URR {}: Total volume quota exhausted ({} >= {})",
                     self.urr_id, total, quota
                 );
-                self.quota_exhausted.store(true, Ordering::Relaxed);
+                self.volume_quota_exhausted.store(true, Ordering::Relaxed);
                 return true;
             }
         }
@@ -1231,7 +1244,7 @@ impl DataPlaneUrr {
             let report_time = self.last_report_time.read().unwrap();
             if let Some(last) = *report_time {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    self.time_threshold_exceeded.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -1246,7 +1259,7 @@ impl DataPlaneUrr {
                         "URR {}: Time quota exhausted ({} >= {})",
                         self.urr_id, elapsed_secs, time_quota
                     );
-                    self.quota_exhausted.store(true, Ordering::Relaxed);
+                    self.time_quota_exhausted.store(true, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -1265,8 +1278,8 @@ impl DataPlaneUrr {
         self.acc_dl_pkts.store(0, Ordering::Relaxed);
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
-        self.threshold_exceeded.store(false, Ordering::Relaxed);
-        self.quota_exhausted.store(false, Ordering::Relaxed);
+        self.time_threshold_exceeded.store(false, Ordering::Relaxed);
+        self.volume_threshold_exceeded.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1774,7 +1787,7 @@ impl DataPlaneSession {
     pub fn has_urr_threshold_exceeded(&self) -> Vec<u32> {
         let urrs = self.urrs.read().unwrap();
         urrs.iter()
-            .filter(|(_, urr)| urr.threshold_exceeded.load(Ordering::Relaxed))
+            .filter(|(_, urr)| (urr.volume_threshold_exceeded.load(Ordering::Relaxed))||(urr.time_threshold_exceeded.load(Ordering::Relaxed)))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -2841,7 +2854,23 @@ impl DataPlane {
         for session in seid_map.values() {
             let urrs = session.urrs.read().unwrap();
             for (urr_id, urr) in urrs.iter() {
-                if urr.threshold_exceeded.load(Ordering::Relaxed) {
+                let volume_threshold_exceeded = urr.volume_threshold_exceeded.load(Ordering::Relaxed);
+                let time_threshold_exceeded = urr.time_threshold_exceeded.load(Ordering::Relaxed);
+                let volume_quota_exhausted = urr.volume_quota_exhausted.load(Ordering::Relaxed)
+                    && urr
+                        .volume_quota_reported
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok();
+                let time_quota_exhausted = urr.time_quota_exhausted.load(Ordering::Relaxed)
+                    && urr
+                        .time_quota_reported
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok();
+                if urr.volume_threshold_exceeded.load(Ordering::Relaxed)
+                    || urr.time_threshold_exceeded.load(Ordering::Relaxed)
+                    || volume_quota_exhausted
+                    || time_quota_exhausted
+                {
                     let entry = UrrReportEntry {
                         upf_seid: session.upf_seid,
                         smf_seid: session.smf_seid,
@@ -2853,15 +2882,36 @@ impl DataPlane {
                         total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
                         ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
                         dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+                        volume_quota_exhausted,
+                        time_quota_exhausted,
+                        volume_threshold_exceeded,
+                        time_threshold_exceeded,
                     };
+                    log::debug!(
+                        "URR report generated for SEID 0x{:x}, URR ID {}, total_bytes={}, ul_bytes={}, dl_bytes={}, total_pkts={}, ul_pkts={}, dl_pkts={}, volume_quota_exhausted={}, time_quota_exhausted={}, volume_threshold_exceeded={}, time_threshold_exceeded={}",
+                        session.upf_seid,
+                        urr_id,
+                        entry.total_bytes,
+                        entry.ul_bytes,
+                        entry.dl_bytes,
+                        entry.total_pkts,
+                        entry.ul_pkts,
+                        entry.dl_pkts,
+                        volume_quota_exhausted,
+                        time_quota_exhausted,
+                        urr.volume_threshold_exceeded.load(Ordering::Relaxed),
+                        urr.time_threshold_exceeded.load(Ordering::Relaxed)
+
+                    );
                     urr.reset_counters();
                     reports.push(entry);
-                }
-            }
 
-            // Periodic reports require both the PERIO trigger and a period.
-            for (urr_id, urr) in urrs.iter() {
-                if urr.trigger_periodic && !urr.threshold_exceeded.load(Ordering::Relaxed) {
+                    // Already reported this pass — don't also fall through to periodic below.
+                    continue;
+                }
+
+                // Periodic reports require both the PERIO trigger and a period.
+                if urr.trigger_periodic {
                     if let Some(period) = urr.measurement_period_secs {
                         let last_report = urr.last_report_time.read().unwrap();
                         if let Some(last) = *last_report {
@@ -2879,7 +2929,22 @@ impl DataPlane {
                                         total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
                                         ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
                                         dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+                                        volume_quota_exhausted: false,
+                                        time_quota_exhausted: false,
+                                        volume_threshold_exceeded: false,
+                                        time_threshold_exceeded: false,
                                     };
+                                    log::debug!(
+                                        "Periodic URR report generated for SEID 0x{:x}, URR ID {}, total_bytes={}, ul_bytes={}, dl_bytes={}, total_pkts={}, ul_pkts={}, dl_pkts={}",
+                                        session.upf_seid,
+                                        urr_id,
+                                        entry.total_bytes,
+                                        entry.ul_bytes,
+                                        entry.dl_bytes,
+                                        entry.total_pkts,
+                                        entry.ul_pkts,
+                                        entry.dl_pkts
+                                    );
                                     urr.reset_counters();
                                     reports.push(entry);
                                 }
@@ -3002,6 +3067,13 @@ pub struct UrrReportEntry {
     pub total_pkts: u64,
     pub ul_pkts: u64,
     pub dl_pkts: u64,
+    /// Report reason: volume quota exhausted (TS 29.244 VOLQU trigger)
+    pub volume_quota_exhausted: bool,
+    /// Report reason: time quota exhausted (TS 29.244 TIMQU trigger)
+    pub time_quota_exhausted: bool,
+    pub volume_threshold_exceeded: bool,
+    pub time_threshold_exceeded: bool,
+
 }
 
 // ============================================================================
@@ -4084,11 +4156,11 @@ mod tests {
         urr.volume_quota_total = Some(100);
 
         assert!(!urr.record(50, true));
-        assert!(urr.threshold_exceeded.load(Ordering::Relaxed));
-        assert!(!urr.quota_exhausted.load(Ordering::Relaxed));
+        assert!(urr.volume_threshold_exceeded.load(Ordering::Relaxed));
+        assert!(!urr.volume_quota_exhausted.load(Ordering::Relaxed));
 
         assert!(urr.record(50, true));
-        assert!(urr.quota_exhausted.load(Ordering::Relaxed));
+        assert!(urr.volume_quota_exhausted.load(Ordering::Relaxed));
     }
 
     // Test that a URR with a time quota does not exhaust the quota until the time quota is exceeded.
@@ -4100,7 +4172,103 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
 
         assert!(urr.record(1, true));
-        assert!(urr.quota_exhausted.load(Ordering::Relaxed));
+        assert!(urr.time_quota_exhausted.load(Ordering::Relaxed));
+    }
+
+    /// Build a DataPlane with one session carrying a single URR, for
+    /// exercising `collect_urr_reports()` without a live socket.
+    fn dp_with_urr_session(urr: DataPlaneUrr) -> DataPlane {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 9);
+        let gnb_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2152);
+        dp.add_session_from_pfcp(0x99, 0x1099, ue_ip, 1, 2, gnb_addr, Some(1), Some(9));
+        let session = dp.sessions.find_by_seid(0x99).unwrap();
+        let urr_id = urr.urr_id;
+        session.urrs.write().unwrap().insert(urr_id, Arc::new(urr));
+        dp
+    }
+
+    #[test]
+    fn test_collect_urr_reports_volume_quota_exhausted() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.volume_quota_total = Some(10);
+        assert!(urr.record(10, true), "quota must be exhausted immediately");
+        let dp = dp_with_urr_session(urr);
+
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].volume_quota_exhausted);
+        assert!(!reports[0].time_quota_exhausted);
+
+        // Exhaustion remains sticky for packet rejection, but its report is one-shot.
+        assert!(dp
+            .sessions
+            .find_by_seid(0x99)
+            .unwrap()
+            .urrs
+            .read()
+            .unwrap()
+            .get(&1)
+            .unwrap()
+            .volume_quota_exhausted
+            .load(Ordering::Relaxed));
+        assert!(dp.collect_urr_reports().is_empty());
+    }
+
+    #[test]
+    fn test_collect_urr_reports_time_quota_exhausted() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.time_quota_secs = Some(60);
+        *urr.last_report_time.write().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        assert!(urr.record(1, true));
+        let dp = dp_with_urr_session(urr);
+
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].time_quota_exhausted);
+        assert!(!reports[0].volume_quota_exhausted);
+        assert!(dp.collect_urr_reports().is_empty());
+    }
+
+    /// Tests that when both volume threshold and quota are exceeded in a single URR,
+    /// only a single report is generated per collection cycle, not duplicate reports
+    /// for each trigger. Verifies that the report correctly includes the volume quota
+    /// exhausted flag even when multiple reporting conditions are met simultaneously.
+    #[test]
+    fn test_collect_urr_reports_threshold_and_quota_single_entry() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.volume_threshold_total = Some(5);
+        urr.volume_quota_total = Some(10);
+        assert!(!urr.record(5, true), "threshold only");
+        assert!(urr.record(5, true), "now quota exhausted too");
+        assert!(urr.volume_threshold_exceeded.load(Ordering::Relaxed));
+        assert!(urr.volume_quota_exhausted.load(Ordering::Relaxed));
+        let dp = dp_with_urr_session(urr);
+
+        // Exactly one report per URR per collection call, not one per flag.
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].volume_quota_exhausted);
+    }
+
+    #[test]
+    fn test_collect_urr_reports_no_double_count_with_periodic() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.volume_quota_total = Some(10);
+        urr.trigger_periodic = true;
+        urr.measurement_period_secs = Some(1);
+        *urr.last_report_time.write().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert!(urr.record(10, true));
+        let dp = dp_with_urr_session(urr);
+
+        // The quota-exhaustion report must not also be duplicated by the
+        // periodic branch in the same collection pass.
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].volume_quota_exhausted);
     }
 
     /// End-to-end buffering behavior: DL packets under a BUFF+NOCP FAR are

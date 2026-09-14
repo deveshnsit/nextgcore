@@ -225,7 +225,7 @@ log_info "Waiting for PDU session establishment..."
 deadline=$((SECONDS + 30))
 pdu_done=false
 while [ $SECONDS -lt $deadline ]; do
-    # Live UE log line: "PDU session {psi} is now ACTIVE (IPv4: ...)"
+    # Live UE log line: "PDU Session {psi} is now ACTIVE (IPv4: ...)"
     if log_grep nextgsim-ue "is now ACTIVE"; then
         pdu_done=true
         break
@@ -510,8 +510,8 @@ assert_log_contains "nextgsim-ue" "Sending PDU Session Establishment Request" \
 assert_log_contains "nextgsim-ue" "PDU Session Establishment Accept" \
     "UE received PDU Session Establishment Accept"
 
-# main.rs: "PDU session {psi} is now ACTIVE (IPv4: {ipv4:?})"
-assert_log_contains "nextgsim-ue" "PDU session 1 is now ACTIVE (IPv4: Some" \
+# main.rs: "PDU Session {psi} is now ACTIVE (IPv4: {ipv4:?})"
+assert_log_contains "nextgsim-ue" "PDU Session 1 is now ACTIVE (IPv4: Some" \
     "UE PDU session 1 ACTIVE with IPv4 address"
 
 assert_log_contains "nextgsim-ue" "Creating TUN interface" \

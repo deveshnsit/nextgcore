@@ -1657,7 +1657,10 @@ impl PfcpServer {
             .iter()
             .map(|r| {
                 let mut trigger = crate::n4_build::UsageReportTrigger::default();
-                trigger.volume_threshold = true;
+                trigger.volume_quota = r.volume_quota_exhausted;
+                trigger.time_quota = r.time_quota_exhausted;
+                trigger.volume_threshold = r.volume_threshold_exceeded;
+                trigger.time_threshold = r.time_threshold_exceeded;
 
                 crate::n4_build::UsageReport {
                     urr_id: r.urr_id,

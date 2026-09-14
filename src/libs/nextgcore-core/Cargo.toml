@@ -15,8 +15,6 @@ libc.workspace = true
 env_logger.workspace = true
 rand.workspace = true
 uuid.workspace = true
-arc-swap.workspace = true
-notify.workspace = true
 tokio = { workspace = true, features = ["time", "sync", "rt"] }
 
 [dev-dependencies]
