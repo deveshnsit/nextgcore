@@ -18,7 +18,7 @@
 #   ./feature-e2e-test.sh redcap xr       # run only the named scenarios
 #   ./feature-e2e-test.sh --down          # tear the stack down after running
 #
-# Scenario names: redcap xr uav-allow uav-deny mint snpn-accept snpn-reject
+# Scenario names: redcap xr uav-allow uav-deny mint snpn-accept snpn-reject usage-quota-time usage-quota-volume usage-quota-periodic
 #
 # Exit codes: 0 all asserted, 1 one or more assertions failed, 2 stack not up.
 
@@ -232,6 +232,70 @@ scn_snpn_reject() {
     assert_log nextgcore-amf "SNPN registration rejected: NID=00000000000"  "AMF rejects the unknown NID (cause #75)"
 }
 
+# Usage Quota Enforcement scenarios
+# Time quota: 120 seconds, Data will be dropped after 120 seconds
+scn_usage_quota_enforcement_time_quota() {
+    log_scn "Usage Quota Enforcement (time quota) — 120 second time limit"
+    reset_core_baseline
+    export FEATURE_SMF_CONFIG="/etc/nextgcore/features/usage_quota_enforcement/time_quota.yaml"
+    export RUST_LOG="debug,h2=warn"
+    recreate smf
+    recreate upf
+    recreate ue
+    # Send initial ping to establish data plane traffic
+    log_info "Sending initial ping within quota window..."
+    docker exec nextgsim-ue timeout 5 ping -c 3 10.45.0.1 >/dev/null 2>&1 || true
+    # Wait 120 seconds for time quota to expire
+    log_info "Waiting 120 seconds for time quota to expire..."
+    sleep 120
+    # Ping should now be rejected (quota exhausted)
+    log_info "Attempting ping after quota expiration (should fail)..."
+    docker exec nextgsim-ue timeout 5 ping -c 1 10.45.0.1 >/dev/null 2>&1 && \
+        log_warn "Ping succeeded after quota expiration (unexpected)" || \
+        log_info "Ping rejected after quota expiration (expected)"
+    wait_for_log nextgcore-upf "time_quota_exhausted=true"
+    assert_log nextgcore-upf "time_quota_exhausted=true" "UPF detects time quota exhausted"
+    assert_log nextgcore-smf "USAR (Usage Report)" "SMF generates Usage Report for time quota exhaustion"
+}
+
+# Volume quota: 10KB, Data will be dropped after 10KB
+scn_usage_quota_enforcement_volume_quota() {
+    log_scn "Usage Quota Enforcement (volume quota) — 10KB volume limit"
+    reset_core_baseline
+    export FEATURE_SMF_CONFIG="/etc/nextgcore/features/usage_quota_enforcement/volume_quota.yaml"
+    export RUST_LOG="debug,h2=warn"
+    recreate smf
+    recreate upf
+    recreate ue
+    # Send pings to exceed volume quota (10KB) and trigger enforcement
+    log_info "Sending pings to exceed 10KB volume quota..."
+    docker exec nextgsim-ue timeout 10 ping -c 11 -s 1000 10.45.0.1 >/dev/null 2>&1 
+    wait_for_log nextgcore-upf "volume_quota_exhausted=true"
+    assert_log nextgcore-upf "volume_quota_exhausted=true" "UPF detects volume quota exhausted"
+    assert_log nextgcore-smf "USAR (Usage Report)" "SMF generates Usage Report for volume quota exhaustion"
+}
+
+# Periodic reporting: 60 seconds, UPF generates periodic URR reports every 60 seconds
+scn_usage_quota_enforcement_periodic_report() {
+    log_scn "Usage Quota Enforcement (periodic report) — 60 second reporting interval"
+    reset_core_baseline
+    export FEATURE_SMF_CONFIG="/etc/nextgcore/features/usage_quota_enforcement/periodic_report.yaml"
+    export RUST_LOG="debug,h2=warn"
+    recreate smf
+    recreate upf
+    recreate ue
+    # Send pings to generate traffic and trigger periodic reports
+    sleep 5  # Allow time for containers to settle before sending traffic
+    log_info "Sending pings to generate traffic for periodic reporting..."
+    docker exec nextgsim-ue timeout 20 ping -c 5 -s 1000 10.45.0.1 >/dev/null 2>&1
+    # Wait for periodic reports to be generated and logged. The config uses time of 60 seconds, but we wait longer to ensure the report is generated and logged.
+    # as we check every 10 seconds for periodic time expiration, we wait for 80 seconds to ensure the report is generated and logged.
+    log_info "Waiting for periodic reports to be generated..."
+    sleep 80  # Allow time for periodic reports to be generated and logged
+    assert_log nextgcore-upf "Periodic URR report generated" "UPF generates periodic URR report for reporting interval"
+    assert_log nextgcore-smf "USAR (Usage Report)" "SMF generates Usage Report for periodic reporting"
+}
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -239,13 +303,13 @@ declare -a REQUESTED=()
 for arg in "$@"; do
     case "$arg" in
         --down) TEARDOWN=true ;;
-        redcap|xr|uav-allow|uav-deny|mint|snpn-accept|snpn-reject) REQUESTED+=("$arg") ;;
+        redcap|xr|uav-allow|uav-deny|mint|snpn-accept|snpn-reject|usage-quota-time|usage-quota-volume|usage-quota-periodic) REQUESTED+=("$arg") ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
     esac
 done
-# Default order runs UE-only scenarios first, SNPN (mutates amf+gnb) last.
+# Default order runs UE-only scenarios first, SNPN (mutates amf+gnb) last, usage quota enforcement last.
 if [ "${#REQUESTED[@]}" -eq 0 ]; then
-    REQUESTED=(redcap xr uav-allow uav-deny mint snpn-accept snpn-reject)
+    REQUESTED=(redcap xr uav-allow uav-deny mint snpn-accept snpn-reject usage-quota-time usage-quota-volume usage-quota-periodic)
 fi
 
 ensure_stack_up
@@ -260,6 +324,9 @@ for scn in "${REQUESTED[@]}"; do
         mint)        scn_mint ;;
         snpn-accept) scn_snpn_accept ;;
         snpn-reject) scn_snpn_reject ;;
+        usage-quota-time) scn_usage_quota_enforcement_time_quota ;;
+        usage-quota-volume) scn_usage_quota_enforcement_volume_quota ;;
+        usage-quota-periodic) scn_usage_quota_enforcement_periodic_report ;;
     esac
 done
 

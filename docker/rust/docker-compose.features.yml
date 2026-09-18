@@ -10,6 +10,7 @@
 #
 #   FEATURE_UE_CONFIG     absolute in-container UE config path (default baseline ue.yaml)
 #   FEATURE_GNB_CONFIG    absolute in-container gNB config path (default baseline gnb.yaml)
+#   FEATURE_SMF_CONFIG    absolute in-container SMF config path (default baseline smf.yaml)
 #   AMF_SNPN_ALLOWED_NIDS comma-separated served NIDs ("" = accept any)
 #   AMF_UAV_GEOFENCE      "min_lat,max_lat,min_lon,max_lon,min_alt,max_alt" ("" = default 0-120m box)
 services:
@@ -23,3 +24,8 @@ services:
     environment:
       AMF_SNPN_ALLOWED_NIDS: "${AMF_SNPN_ALLOWED_NIDS:-}"
       AMF_UAV_GEOFENCE: "${AMF_UAV_GEOFENCE:-}"
+
+  smf:
+    command: ["-c", "${FEATURE_SMF_CONFIG:-/etc/nextgcore/smf.yaml}"]
+    volumes:
+      - ./configs/5gc/features:/etc/nextgcore/features:ro

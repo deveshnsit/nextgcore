@@ -462,13 +462,16 @@ fn get_urr(_dnn: &str) -> Option<n4_build::UrrParams> {
 /// Convert a configured URR profile into the PFCP builder's flat parameter type.
 fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams {
     let mut triggers = 0u32;
+    // TS 29.244: Reporting Triggers is 3 octets
+    // Octet 5 (bits 23-16): PERIO=bit1, VOLTH=bit2, TIMTH=bit3
+    // Octet 6 (bits 15-8): VOLQU=bit1, TIMQU=bit2
     if cfg_profile
         .reporting_triggers
         .as_ref()
         .and_then(|rt| rt.periodic_reporting)
         .unwrap_or(false)
     {
-        triggers |= 0x000001;
+        triggers |= 0x010000;  // PERIO: Octet 5, Bit 1
     }
     if cfg_profile
         .reporting_triggers
@@ -476,7 +479,7 @@ fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams
         .and_then(|rt| rt.volume_threshold)
         .unwrap_or(true)
     {
-        triggers |= 0x000002;
+        triggers |= 0x020000;  // VOLTH: Octet 5, Bit 2
     }
     if cfg_profile
         .reporting_triggers
@@ -484,7 +487,7 @@ fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams
         .and_then(|rt| rt.time_threshold)
         .unwrap_or(false)
     {
-        triggers |= 0x000004;
+        triggers |= 0x040000;  // TIMTH: Octet 5, Bit 3
     }
     if cfg_profile
         .reporting_triggers
@@ -492,7 +495,7 @@ fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams
         .and_then(|rt| rt.volume_quota_exhausted)
         .unwrap_or(false)
     {
-        triggers |= 0x000200;
+        triggers |= 0x000100;  // VOLQU: Octet 6, Bit 1
     }
     if cfg_profile
         .reporting_triggers
@@ -500,7 +503,7 @@ fn urr_params_from_config(cfg_profile: &UrfProfileConfig) -> n4_build::UrrParams
         .and_then(|rt| rt.time_quota_exhausted)
         .unwrap_or(false)
     {
-        triggers |= 0x000400;
+        triggers |= 0x000200;  // TIMQU: Octet 6, Bit 2
     }
 
     n4_build::UrrParams {
@@ -545,7 +548,7 @@ fn default_urr_profile() -> n4_build::UrrParams {
     n4_build::UrrParams {
         urr_id: allocate_urr_id(),
         measurement_method: (false, true, false),
-        reporting_triggers: 0x000002,
+        reporting_triggers: 0x020000,  // VOLTH: Octet 5, Bit 2
         measurement_period: None,
         volume_threshold: Some((Some(1024), None, None)),
         volume_quota: None,
@@ -3717,10 +3720,10 @@ smf:
         // Verify that the built-in default profile (used as fallback) has:
         // - Volume measurement method enabled
         // - Default volume threshold of 1024 bytes
-        // - Periodic reporting trigger
+        // - Volume threshold reporting trigger (VOLTH: Octet 5, Bit 2)
         let default = default_urr_profile();
         assert_eq!(default.measurement_method, (false, true, false), "Volume measurement enabled");
-        assert_eq!(default.reporting_triggers, 0x000002, "Periodic reporting enabled");
+        assert_eq!(default.reporting_triggers, 0x020000, "Volume threshold reporting enabled (VOLTH)");
         assert_eq!(
             default.volume_threshold,
             Some((Some(1024), None, None)),

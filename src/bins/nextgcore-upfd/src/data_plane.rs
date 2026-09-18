@@ -2912,6 +2912,7 @@ impl DataPlane {
 
                 // Periodic reports require both the PERIO trigger and a period.
                 if urr.trigger_periodic {
+                    let mut periodic_generated = false; // Track if a periodic report was generated for this URR
                     if let Some(period) = urr.measurement_period_secs {
                         let last_report = urr.last_report_time.read().unwrap();
                         if let Some(last) = *last_report {
@@ -2945,11 +2946,19 @@ impl DataPlane {
                                         entry.ul_pkts,
                                         entry.dl_pkts
                                     );
-                                    urr.reset_counters();
+                                    periodic_generated = true;
                                     reports.push(entry);
                                 }
                             }
                         }
+                    }
+                    if periodic_generated
+                    {
+                       //RwLock in Rust cannot be upgraded from read to write on the same thread. When you hold a read lock and try to acquire a write lock (even on the same thread), it deadlocks. 
+                       // let last_report = urr.last_report_time.read().unwrap();
+                       // Hence using a separate scope to drop the read lock before acquiring the write lock in reset_counters() method.
+                       log::debug!("Periodic URR report generated , resetting counters for SEID 0x{:x}, URR ID {}", session.upf_seid, urr_id);
+                       urr.reset_counters(); 
                     }
                 }
             }
@@ -4269,6 +4278,21 @@ mod tests {
         let reports = dp.collect_urr_reports();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].volume_quota_exhausted);
+    }
+
+    #[test]
+    // Simple test that a URR with periodic reporting enabled will generate a report when the measurement period has elapsed.
+    fn test_collect_urr_reports_periodic() {
+        let mut urr = DataPlaneUrr::new(1);
+        urr.trigger_periodic = true;
+        //No quota exhaustion, hence asserting for false
+        urr.measurement_period_secs = Some(6);
+        assert!(!urr.record(10, false));
+        *urr.last_report_time.write().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        let dp = dp_with_urr_session(urr);
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
     }
 
     /// End-to-end buffering behavior: DL packets under a BUFF+NOCP FAR are

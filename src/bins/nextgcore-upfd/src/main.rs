@@ -376,6 +376,7 @@ async fn main() -> Result<()> {
             }
             let reports = dp_for_urr.collect_urr_reports();
             if reports.is_empty() {
+                log::debug!("No URR reports to send this interval");
                 continue;
             }
 
@@ -385,11 +386,19 @@ async fn main() -> Result<()> {
                 Vec<data_plane::UrrReportEntry>,
             > = std::collections::HashMap::new();
             for report in reports {
+                log::debug!(
+                    "Collected URR report: UPF_SEID={:#x}, SMF_SEID={:#x}, URR_ID={}",
+                    report.upf_seid,
+                    report.smf_seid,
+                    report.urr_id
+                );
                 grouped
                     .entry((report.upf_seid, report.smf_seid))
                     .or_default()
                     .push(report);
             }
+
+            log::debug!("Sending URR reports in {} batches", grouped.len());
 
             for ((upf_seid, smf_seid), session_reports) in grouped {
                 log::info!(
@@ -845,8 +854,8 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             urr.measurement_period_secs = u.measurement_period_secs;
 
                             log::debug!(
-                                "Installing URR {} (vol_thresh_total={:?}, vol_quota_total={:?}, time_thresh_secs={:?}, time_quota_secs={:?}) for SEID={upf_seid:#x}",
-                                urr.urr_id, urr.volume_threshold_total, urr.volume_quota_total, urr.time_threshold_secs, urr.time_quota_secs
+                                "Installing URR {} (vol_thresh_total={:?}, vol_quota_total={:?}, time_thresh_secs={:?}, time_quota_secs={:?}) , measurement_period_secs={:?} , trigger_periodic={} for SEID={upf_seid:#x}",
+                                urr.urr_id, urr.volume_threshold_total, urr.volume_quota_total, urr.time_threshold_secs, urr.time_quota_secs, urr.measurement_period_secs, urr.trigger_periodic 
                             );
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
 
